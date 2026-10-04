@@ -1,5 +1,13 @@
 # yiTrace
 
+## 评测改进，还是排查执行过程？
+
+- [Fuju RSI](https://github.com/vibeinging/fuju-rsi)：通过编码 Agent Skill 评测和改进已有程序，先从智能问数开始。可以离线试玩，或连接真实程序生成原版报告。
+- [Fuju Trace](https://github.com/vibeinging/fuju-trace)：记录、检索和排查 Agent 的执行过程。
+
+本仓库保留原 yiTrace 引擎与兼容包。RSI 是独立的开发工具，业务程序可继续按原有方式运行。
+
+
 **给 Agent 工程用的本地 TraceDB。**
 
 Agent 工程，也就是 agentic engineering，需要的不只是 prompt、日志和聊天记忆。你需要看到
@@ -234,8 +242,8 @@ cp -r dist ../yitrace-engine/crates/yt-engine/console_dist
 改 engine、console 或包封装时走源码路径。
 
 ```bash
-git clone https://github.com/vibeinging/yiTrace.git
-cd yiTrace
+git clone https://github.com/vibeinging/fuju.git
+cd fuju
 
 cd yitrace-engine
 cargo test --offline

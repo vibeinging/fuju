@@ -1,5 +1,13 @@
 # yiTrace
 
+## Agent evaluation or trace diagnostics?
+
+- [Fuju RSI](https://github.com/vibeinging/fuju-rsi): test and improve existing agents with a coding-agent Skill, starting with text-to-SQL. Try the offline example or connect a real program for a baseline report.
+- [Fuju Trace](https://github.com/vibeinging/fuju-trace): record, search, and diagnose agent execution.
+
+This repository contains the original yiTrace engine and compatibility packages. RSI is a separate development tool; applications can run without it.
+
+
 **A local TraceDB for agentic engineering.**
 
 Agentic engineering needs more than prompts, logs, and chat memory. You need to
@@ -246,8 +254,8 @@ The console uses the same `/v1/*` JSON API as any custom UI.
 Use this path when you are changing the engine, console, or package wrappers.
 
 ```bash
-git clone https://github.com/vibeinging/yiTrace.git
-cd yiTrace
+git clone https://github.com/vibeinging/fuju.git
+cd fuju
 
 cd yitrace-engine
 cargo test --offline
