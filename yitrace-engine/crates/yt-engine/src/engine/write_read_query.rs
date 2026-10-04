@@ -53,7 +53,7 @@ impl WriteCoordinator {
                 tenant_id: q.tenant_id,
                 ..Default::default()
             };
-            let keys = self.filter_candidate_span_keys(&filter);
+            let keys = self.filter_candidate_span_keys_for_snapshot(snap, &filter);
             if !keys.is_empty() {
                 let (spans, stats) = self.fold_query(snap, q, Some(&keys), Projection::ALL);
                 return (spans, stats.scanned_segments);
@@ -91,7 +91,7 @@ impl WriteCoordinator {
         };
 
         if candidate_filter.needs_attrs() {
-            let keys = self.filter_candidate_span_keys(&candidate_filter);
+            let keys = self.filter_candidate_span_keys_for_snapshot(snap, &candidate_filter);
             stats.used_filter_index = true;
             stats.candidate_span_keys = Some(keys.len());
             if keys.is_empty() {
@@ -102,6 +102,10 @@ impl WriteCoordinator {
             stats.point_lookup_segments = scan.point_lookup_segments;
             stats.decoded_segment_rows = scan.decoded_segment_rows;
             stats.decoded_memtable_rows = scan.decoded_memtable_rows;
+            stats.index_bytes_read = scan.index_bytes_read;
+            stats.data_bytes_read = scan.data_bytes_read;
+            stats.indexes_validated = scan.indexes_validated;
+            stats.indexes_rebuilt = scan.indexes_rebuilt;
             stats.matched_spans = spans.len();
             return (spans, stats);
         }
@@ -116,6 +120,10 @@ impl WriteCoordinator {
         stats.point_lookup_segments = scan.point_lookup_segments;
         stats.decoded_segment_rows = scan.decoded_segment_rows;
         stats.decoded_memtable_rows = scan.decoded_memtable_rows;
+        stats.index_bytes_read = scan.index_bytes_read;
+        stats.data_bytes_read = scan.data_bytes_read;
+        stats.indexes_validated = scan.indexes_validated;
+        stats.indexes_rebuilt = scan.indexes_rebuilt;
         stats.matched_spans = spans.len();
         (spans, stats)
     }

@@ -74,7 +74,13 @@ impl WriteCoordinator {
         // session_id -> (distinct traces, span_count, in_tok, out_tok)
         let mut acc: BTreeMap<
             u64,
-            (std::collections::HashSet<u64>, usize, u64, u64, CacheTokenCoverage),
+            (
+                std::collections::HashSet<u64>,
+                usize,
+                u64,
+                u64,
+                CacheTokenCoverage,
+            ),
         > = BTreeMap::new();
         for s in spans {
             if let Some(sid) = s.session_id {
@@ -87,18 +93,20 @@ impl WriteCoordinator {
             }
         }
         acc.into_iter()
-            .map(|(session_id, (traces, span_count, i, o, c))| SessionSummary {
-                session_id,
-                trace_count: traces.len(),
-                span_count,
-                total_input_tokens: i,
-                total_output_tokens: o,
-                total_cache_read_tokens: c.read_total(),
-                total_cache_write_tokens: c.write_total(),
-                cache_read_reported_spans: c.read_reported_spans,
-                cache_write_reported_spans: c.write_reported_spans,
-                total_llm_spans: c.total_llm_spans,
-            })
+            .map(
+                |(session_id, (traces, span_count, i, o, c))| SessionSummary {
+                    session_id,
+                    trace_count: traces.len(),
+                    span_count,
+                    total_input_tokens: i,
+                    total_output_tokens: o,
+                    total_cache_read_tokens: c.read_total(),
+                    total_cache_write_tokens: c.write_total(),
+                    cache_read_reported_spans: c.read_reported_spans,
+                    cache_write_reported_spans: c.write_reported_spans,
+                    total_llm_spans: c.total_llm_spans,
+                },
+            )
             .collect()
     }
 
@@ -216,7 +224,12 @@ impl WriteCoordinator {
             ..Default::default()
         };
         self.ensure_trace_rollup_current();
-        if let Some(rows) = self.trace_rollup.lock().unwrap().query_sessions(&query, &filter) {
+        if let Some(rows) = self
+            .trace_rollup
+            .lock()
+            .unwrap()
+            .query_sessions(&query, &filter)
+        {
             return rows;
         }
         let (spans, _) = self.read_spans_query(snap, &query);
@@ -249,7 +262,12 @@ impl WriteCoordinator {
         };
         filter.attrs = attrs.clone();
         self.ensure_trace_rollup_current();
-        if let Some(rows) = self.trace_rollup.lock().unwrap().query_sessions(&q, &filter) {
+        if let Some(rows) = self
+            .trace_rollup
+            .lock()
+            .unwrap()
+            .query_sessions(&q, &filter)
+        {
             return rows;
         }
         let (spans, _) = self.read_spans_query(snap, &q);
@@ -313,7 +331,20 @@ impl WriteCoordinator {
         span_id: u64,
         tenant: Option<u64>,
     ) -> (Option<ConsoleSpan>, ReadPlanStats) {
-        let keys = HashSet::from([(trace_id, span_id)]);
+        let keys = match tenant {
+            Some(t) => HashSet::from([(Some(t), trace_id, span_id)]),
+            None => self
+                .filter_candidate_span_keys_for_snapshot(
+                    snap,
+                    &SearchFilter {
+                        trace_id: Some(trace_id),
+                        ..Default::default()
+                    },
+                )
+                .into_iter()
+                .filter(|key| key.2 == span_id)
+                .collect(),
+        };
         let mut q = TraceQuery::trace(trace_id, i64::MIN, i64::MAX);
         q.tenant_id = tenant;
         let (mut spans, scan) = self.fold_query(snap, &q, Some(&keys), Projection::ALL);
@@ -436,7 +467,8 @@ impl WriteCoordinator {
             stats.scanned_segments += 1;
             if let Some(scan) = self.segments.scan_records_for_keys(entry.segment_id, keys) {
                 stats.decoded_segment_rows += scan.decoded_rows;
-                stats.index_bytes_read = stats.index_bytes_read.saturating_add(scan.index_bytes_read);
+                stats.index_bytes_read =
+                    stats.index_bytes_read.saturating_add(scan.index_bytes_read);
                 stats.data_bytes_read = stats.data_bytes_read.saturating_add(scan.data_bytes_read);
                 stats.indexes_validated += scan.indexes_validated;
                 stats.indexes_rebuilt += scan.indexes_rebuilt;

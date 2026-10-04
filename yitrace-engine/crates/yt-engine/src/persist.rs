@@ -270,18 +270,33 @@ pub fn save(path: impl AsRef<Path>, state: &PersistedState) -> std::io::Result<(
     std::fs::rename(&tmp, path)
 }
 
-/// 读 manifest。缺文件 / crc 不符 / 格式不认 → None（当作"无持久 manifest，从空开始"）。
+/// 兼容旧的可选读取入口；数据库恢复必须使用 `try_load` 区分缺失与损坏。
 pub fn load(path: impl AsRef<Path>) -> Option<PersistedState> {
-    let bytes = std::fs::read(path).ok()?;
+    try_load(path).ok().flatten()
+}
+
+/// 只有首次创建时的缺文件允许空库；损坏或读失败必须拒绝恢复，避免删除状态丢失。
+pub fn try_load(path: impl AsRef<Path>) -> std::io::Result<Option<PersistedState>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid yiTrace manifest (CRC or format)",
+        )
+    };
     if bytes.len() < 4 {
-        return None;
+        return Err(invalid());
     }
-    let crc = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
+    let crc = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
     let payload = &bytes[4..];
     if crc != yt_wal::crc32(payload) {
-        return None; // 损坏 → 不用脏 manifest
+        return Err(invalid());
     }
-    decode(payload)
+    decode(payload).map(Some).ok_or_else(invalid)
 }
 
 #[cfg(test)]

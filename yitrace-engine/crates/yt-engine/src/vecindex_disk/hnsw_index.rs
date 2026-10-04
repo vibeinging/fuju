@@ -27,6 +27,8 @@ pub struct DiskGraphIndex {
     /// 入口点 (node_id, 它的 level)。None = 空图。
     entry: Mutex<Option<(u32, u8)>>,
     upper_path: PathBuf,
+    mutation: Mutex<()>,
+    identities: Mutex<Option<FastMap<crate::ScopedSpanKey, u32>>>,
 }
 
 impl DiskGraphIndex {
@@ -60,6 +62,8 @@ impl DiskGraphIndex {
             upper: Mutex::new(upper),
             entry: Mutex::new(entry),
             upper_path,
+            mutation: Mutex::new(()),
+            identities: Mutex::new(None),
         })
     }
 
@@ -231,9 +235,18 @@ impl DiskGraphIndex {
     }
 
     /// 多层插入：顶层贪心下沉找入口 → 各层 search_layer 连边 + 反向边度数剪枝；新点层级更高则成为新入口。
-    fn insert(&self, trace_id: u64, span_id: u64, vector: &[f32]) -> std::io::Result<()> {
+    fn insert(
+        &self,
+        tenant_id: Option<u64>,
+        trace_id: u64,
+        span_id: u64,
+        vector: &[f32],
+    ) -> std::io::Result<()> {
         // 先占槽得 id（层级由 id 确定性算），再补写 level。
-        let Some(id) = self.store.add_node(trace_id, span_id, vector, 0)? else {
+        let Some(id) = self
+            .store
+            .add_node_scoped(tenant_id, trace_id, span_id, vector, 0)?
+        else {
             return Ok(());
         };
         let level = self.level_for(id);
@@ -305,6 +318,80 @@ impl DiskGraphIndex {
         Ok(())
     }
 
+    fn ensure_identities(&self) -> std::io::Result<()> {
+        let mut identities = self.identities.lock().unwrap();
+        if identities.is_some() {
+            return Ok(());
+        }
+        // 只在第一次向量操作读取节点身份，恢复入口不扫描向量或整个节点文件。
+        let mut latest = FastMap::default();
+        for id in 0..self.store.len() as u32 {
+            let node = self.store.read_node(id)?;
+            if !node.deleted {
+                latest.insert((node.tenant_id, node.trace_id, node.span_id), id);
+            }
+        }
+        *identities = Some(latest);
+        Ok(())
+    }
+
+    fn upsert(
+        &self,
+        tenant_id: Option<u64>,
+        trace_id: u64,
+        span_id: u64,
+        vector: &[f32],
+    ) -> std::io::Result<()> {
+        let _mutation = self.mutation.lock().unwrap();
+        if vector.len() != self.store.dim || vector.iter().any(|v| !v.is_finite()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "embedding dimension or value is invalid",
+            ));
+        }
+        self.ensure_identities()?;
+        let key = (tenant_id, trace_id, span_id);
+        let previous = self
+            .identities
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .get(&key)
+            .copied();
+        if let Some(old) = previous {
+            if self.store.read_vector(old)? == vector {
+                return Ok(());
+            }
+        }
+        let new_id = self.store.len() as u32;
+        self.insert(tenant_id, trace_id, span_id, vector)?;
+        if let Some(old) = previous {
+            self.store.mark_deleted(old)?;
+        }
+        self.identities
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .insert(key, new_id);
+        // 向量更新是独立提交；其它进程重开时需要同批上层入口和新的身份版本。
+        self.publish_generation()?;
+        Ok(())
+    }
+
+    fn publish_generation(&self) -> std::io::Result<()> {
+        let generation_path = self.store.dir.join("generation");
+        let generation = std::fs::read(&generation_path)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .map(u64::from_le_bytes)
+            .unwrap_or(0);
+        let tmp = generation_path.with_extension("tmp");
+        std::fs::write(&tmp, generation.wrapping_add(1).to_le_bytes())?;
+        std::fs::rename(&tmp, generation_path)
+    }
+
     /// 暴力精确搜索（测试用 ground-truth；带过滤、跳软删）。
     pub fn brute_force(
         &self,
@@ -347,22 +434,87 @@ impl DiskGraphIndex {
 }
 
 impl GraphIndex for DiskGraphIndex {
+    fn needs_legacy_tenant_migration(&self) -> bool {
+        self.store.legacy_tenant_slots.lock().unwrap().is_some()
+    }
+    fn legacy_embedding_keys(&self) -> std::io::Result<Vec<(u64, u64)>> {
+        let legacy = self.store.legacy_tenant_slots.lock().unwrap();
+        let mut keys = std::collections::BTreeSet::new();
+        if let Some((start, end)) = *legacy {
+            for id in start..end {
+                let node = self.store.read_node(id)?;
+                if !node.deleted {
+                    keys.insert((node.trace_id, node.span_id));
+                }
+            }
+        }
+        Ok(keys.into_iter().collect())
+    }
+    fn migrate_legacy_embeddings(
+        &self,
+        tenants: &HashMap<(u64, u64), Option<u64>>,
+    ) -> std::io::Result<()> {
+        {
+            let _mutation = self.mutation.lock().unwrap();
+            let mut legacy = self.store.legacy_tenant_slots.lock().unwrap();
+            let Some((start, end)) = *legacy else {
+                return Ok(());
+            };
+            for id in start..end {
+                let node = self.store.read_node(id)?;
+                let tenant = tenants.get(&(node.trace_id, node.span_id)).copied();
+                // 源span已删除时旧向量只可退役，不能赋给碰巧复用相同ID的租户。
+                if tenant.is_none() && !node.deleted {
+                    self.store.mark_deleted(id)?;
+                }
+                self.store.write_tenant(id, tenant.flatten())?;
+            }
+            self.store.tenants.sync_data()?;
+            std::fs::write(self.store.dir.join("tenant_format"), b"YT-TENANTS-1")?;
+            self.publish_generation()?;
+            self.identities.lock().unwrap().take();
+            legacy.take();
+        }
+        self.flush_checked()
+    }
+    fn supports_tenant_scope(&self) -> bool {
+        true
+    }
     fn index_embedding(&self, trace_id: u64, span_id: u64, embedding: Vec<f32>) {
-        // Cosine：索引时归一化成单位向量存储。归一化后 cosine 距离与 L2² 单调等价 → 整条建图/检索复用 l2_sq。
-        let v: Vec<f32> = if self.metric == Metric::Cosine {
+        self.index_embedding_scoped(None, trace_id, span_id, embedding)
+            .expect("vector write failed");
+    }
+    fn index_embedding_scoped(
+        &self,
+        tenant_id: Option<u64>,
+        trace_id: u64,
+        span_id: u64,
+        embedding: Vec<f32>,
+    ) -> std::io::Result<()> {
+        let vector = if self.metric == Metric::Cosine {
             simd::normalize(&embedding).0
         } else {
             embedding
         };
-        let _ = self.insert(trace_id, span_id, &v);
+        self.upsert(tenant_id, trace_id, span_id, &vector)
     }
-
     fn search(
         &self,
         query: &[f32],
         k: usize,
         filter: &dyn Fn(u64, u64) -> bool,
     ) -> Vec<(u64, u64, f32)> {
+        self.search_scoped(query, k, &|tenant, t, s| tenant.is_none() && filter(t, s))
+            .into_iter()
+            .map(|(_, t, s, d)| (t, s, d))
+            .collect()
+    }
+    fn search_scoped(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter: &dyn Fn(Option<u64>, u64, u64) -> bool,
+    ) -> Vec<(Option<u64>, u64, u64, f32)> {
         if k == 0 || query.len() != self.store.dim {
             return Vec::new();
         }
@@ -389,8 +541,17 @@ impl GraphIndex for DiskGraphIndex {
         }
 
         // 底层 ef_search beam + 进图过滤（admit = 未删 + 业务谓词）。node_arc 不克隆。
+        if self.ensure_identities().is_err() {
+            return Vec::new();
+        }
+        let identities = self.identities.lock().unwrap();
+        let latest = identities.as_ref().unwrap();
         let admit = |q: u32| match self.store.node_arc(q) {
-            Ok(a) => !a.deleted && filter(a.trace_id, a.span_id),
+            Ok(a) => {
+                !a.deleted
+                    && latest.get(&(a.tenant_id, a.trace_id, a.span_id)) == Some(&q)
+                    && filter(a.tenant_id, a.trace_id, a.span_id)
+            }
             Err(_) => false,
         };
         let ef = self.ef_search.max(k);
@@ -402,14 +563,14 @@ impl GraphIndex for DiskGraphIndex {
                 d.max(0.0).sqrt()
             }
         };
-        let mut out: Vec<(u64, u64, f32)> = self
+        let mut out: Vec<(Option<u64>, u64, u64, f32)> = self
             .search_layer(query, &[ep], ef, 0, &admit)
             .into_iter()
             .filter_map(|(id, d)| {
                 self.store
                     .read_node(id)
                     .ok()
-                    .map(|r| (r.trace_id, r.span_id, finalize(d)))
+                    .map(|r| (r.tenant_id, r.trace_id, r.span_id, finalize(d)))
             })
             .collect();
         out.truncate(k);
@@ -417,10 +578,21 @@ impl GraphIndex for DiskGraphIndex {
     }
 
     fn flush(&self) {
-        let _ = self.store.sync();
-        let upper = self.upper.lock().unwrap();
-        let entry = *self.entry.lock().unwrap();
-        let _ = save_upper(&self.upper_path, &upper, entry);
+        self.flush_checked().expect("vector flush failed");
+    }
+    fn flush_checked(&self) -> std::io::Result<()> {
+        let _mutation = self.mutation.lock().unwrap();
+        self.store.sync()?;
+        save_upper(
+            &self.upper_path,
+            &self.upper.lock().unwrap(),
+            *self.entry.lock().unwrap(),
+        )?;
+        File::open(&self.upper_path)?.sync_data()?;
+        if let Ok(directory) = File::open(&self.store.dir) {
+            directory.sync_all()?;
+        }
+        Ok(())
     }
 }
 

@@ -11,7 +11,11 @@ impl WriteCoordinator {
     /// - WAL 有未 flush 尾部时，恢复会先补齐历史读模型再叠加尾部，保证增量不被后加载缓存覆盖。
     /// - 向量**段里推不出来**：从独立向量文件重载,喂回图索引(后写覆盖先写)。
     pub fn recover(&self) {
-        let _process = self.acquire_process_lock("write");
+        self.try_recover().expect("yiTrace recovery failed");
+    }
+
+    pub fn try_recover(&self) -> std::io::Result<()> {
+        let _process = self.try_acquire_process_lock("write")?;
         let _local = self.write_lock.lock().unwrap();
         let started = std::time::Instant::now();
         olog::log(
@@ -19,14 +23,20 @@ impl WriteCoordinator {
             "recover_start",
             &[("version", &self.current.version())],
         );
-        if let Some(state) = self.manifest_path.as_ref().and_then(persist::load) {
+        if let Some(state) = self
+            .manifest_path
+            .as_ref()
+            .map(persist::try_load)
+            .transpose()?
+            .flatten()
+        {
             self.current.replace_from_disk(state.manifest);
             *self.next_segment_id.lock().unwrap() = state.next_segment_id;
             *self.next_chunk_id.lock().unwrap() = state.next_chunk_id;
         }
-        self.wal.lock().unwrap().refresh_from_disk();
+        self.wal.lock().unwrap().try_refresh_from_disk()?;
         self.refresh_metadata_from_disk_locked();
-        let seg_count = self.rebuild_volatile_from_current_locked();
+        let seg_count = self.rebuild_volatile_from_current_locked()?;
         let wal_count = self.memtable.lock().unwrap().len() as u64;
         let tail = self.current.committed_tail();
         let duration_us = started.elapsed().as_micros() as u64;
@@ -43,6 +53,7 @@ impl WriteCoordinator {
                 ("duration_ms", &duration_ms),
             ],
         );
+        Ok(())
     }
 
     /// 测试/演示：模拟崩溃，丢弃易失的 MemTable。WAL 与 manifest 是持久的，保留不动。
@@ -67,11 +78,20 @@ impl WriteCoordinator {
     /// flush 提交（sealed → live）：把一批已 ack 事件封段，新段 Live 进新版本，watermark 推进。
     /// 段加入 + watermark 推进必须在**同一次** commit 里原子生效（堵「既不在 memtable 又不在段」空窗）。
     pub fn commit_flush(&self, records: &[WalRecord], up_to_lsn: WalLsn) {
-        let _process = self.acquire_process_lock("write");
+        self.try_commit_flush(records, up_to_lsn)
+            .expect("yiTrace flush commit failed");
+    }
+
+    pub fn try_commit_flush(
+        &self,
+        records: &[WalRecord],
+        up_to_lsn: WalLsn,
+    ) -> std::io::Result<()> {
+        let _process = self.try_acquire_process_lock("write")?;
         let _w = self.write_lock.lock().unwrap();
-        self.refresh_from_disk_locked();
+        self.refresh_from_disk_locked()?;
         let seg = self.alloc_segment_id();
-        self.segments.flush_to_segment(seg, records); // building→sealed（写完 fsync）
+        self.segments.try_flush_to_segment(seg, records)?; // building→sealed（写完 fsync）
         let bloom = KeyBloom::build(
             records.iter().map(|r| (r.trace_id, r.span_id)),
             records.len(),
@@ -97,7 +117,7 @@ impl WriteCoordinator {
                 upgrade_seq: 0,
             },
         );
-        self.commit_and_persist(draft); // 原子换指针：sealed→live + watermark 同时生效;并落盘 manifest
+        self.commit_and_persist(draft)?; // 原子换指针：sealed→live + watermark 同时生效;并落盘 manifest
         if let Err(err) = self.wal.lock().unwrap().checkpoint(up_to_lsn) {
             // checkpoint 只是恢复加速器；写失败不影响 WAL/manifest 正确性，下次启动回退全量校验。
             olog::log(
@@ -112,13 +132,19 @@ impl WriteCoordinator {
         let gate = WalLsn::new(self.current.min_retained_watermark());
         self.memtable.lock().unwrap().evict_up_to(gate);
         self.persist_read_model_sidecars();
+        Ok(())
     }
 
     /// 删除提交：给某段换一个新的 deletion 块（deletion_seq+1），绝不原地改旧块。
     pub fn commit_delete(&self, seg: SegmentId, row: u32) {
-        let _process = self.acquire_process_lock("write");
+        self.try_commit_delete(seg, row)
+            .expect("yiTrace delete commit failed");
+    }
+
+    pub fn try_commit_delete(&self, seg: SegmentId, row: u32) -> std::io::Result<()> {
+        let _process = self.try_acquire_process_lock("write")?;
         let _w = self.write_lock.lock().unwrap();
-        self.refresh_from_disk_locked();
+        self.refresh_from_disk_locked()?;
         let chunk_id = self.alloc_chunk_id();
         let mut draft = self.current.cow_next();
         if let Some(entry) = draft.segments.get_mut(&seg.get()) {
@@ -126,13 +152,14 @@ impl WriteCoordinator {
             entry.deletion_vec = Arc::new(new_dv);
             entry.deletion_seq += 1;
         }
-        self.commit_and_persist(draft);
+        self.commit_and_persist(draft)?;
         self.session_idx.lock().unwrap().dirty = true; // 删除改了段，边车下次读重建
         self.rebuild_trace_rollup_current();
         self.rebuild_filter_attrs_current();
         self.rebuild_bm25_current();
         *self.segment_scan_indexes_stale.lock().unwrap() = false;
         self.persist_read_model_sidecars();
+        Ok(())
     }
 
     /// 属性补写（upgrade）提交：给某段 (trace_id, span_id) 补写**非身份属性**，与 delete 完全对称——
@@ -145,9 +172,43 @@ impl WriteCoordinator {
         span_id: u64,
         fields: yt_core::fold::SpanFields,
     ) {
-        let _process = self.acquire_process_lock("write");
+        self.try_commit_upgrade(seg, trace_id, span_id, fields)
+            .expect("yiTrace upgrade commit failed");
+    }
+
+    pub fn try_commit_upgrade(
+        &self,
+        seg: SegmentId,
+        trace_id: u64,
+        span_id: u64,
+        mut fields: yt_core::fold::SpanFields,
+    ) -> std::io::Result<()> {
+        let _process = self.try_acquire_process_lock("write")?;
         let _w = self.write_lock.lock().unwrap();
-        self.refresh_from_disk_locked();
+        self.refresh_from_disk_locked()?;
+        // 旧 upgrade 接缝只含 trace/span，不能把同段里不同 tenant 的同名 span 一起改掉。
+        let tenants: std::collections::HashSet<Option<u64>> = self
+            .segments
+            .scan_records(seg)
+            .iter()
+            .filter(|r| r.trace_id == trace_id && r.span_id == span_id)
+            .map(|r| r.fields.tenant_id)
+            .collect();
+        if tenants.len() > 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "ambiguous tenant for trace/span upgrade",
+            ));
+        }
+        if let Some(&tenant) = tenants.iter().next() {
+            if fields.tenant_id.is_some() && fields.tenant_id != tenant {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "upgrade cannot change tenant identity",
+                ));
+            }
+            fields.tenant_id = tenant;
+        }
         let chunk_id = self.alloc_chunk_id();
         let mut draft = self.current.cow_next();
         if let Some(entry) = draft.segments.get_mut(&seg.get()) {
@@ -160,21 +221,27 @@ impl WriteCoordinator {
             entry.upgrade_ref = Some(Arc::new(new_chunk));
             entry.upgrade_seq += 1;
         }
-        self.commit_and_persist(draft);
+        self.commit_and_persist(draft)?;
         self.session_idx.lock().unwrap().dirty = true; // 补写改了段，边车下次读重建
         self.rebuild_trace_rollup_current();
         self.rebuild_filter_attrs_current();
         self.rebuild_bm25_current();
         *self.segment_scan_indexes_stale.lock().unwrap() = false;
         self.persist_read_model_sidecars();
+        Ok(())
     }
 
     /// compaction 第 1 步：选段，记录选段瞬间各输入段的 (deletion_seq, upgrade_seq)。
     /// 返回的 plan 交给调用方在**锁外**做昂贵的段重建，再用 `compaction_finish` 提交。
     pub fn compaction_begin(&self, inputs: &[SegmentId]) -> CompactionPlan {
-        let _process = self.acquire_process_lock("write");
+        self.try_compaction_begin(inputs)
+            .expect("yiTrace compaction selection failed")
+    }
+
+    pub fn try_compaction_begin(&self, inputs: &[SegmentId]) -> std::io::Result<CompactionPlan> {
+        let _process = self.try_acquire_process_lock("write")?;
         let _w = self.write_lock.lock().unwrap();
-        self.refresh_from_disk_locked();
+        self.refresh_from_disk_locked()?;
         let m = self.current.manifest();
         let seqs_at_select = inputs
             .iter()
@@ -184,10 +251,10 @@ impl WriteCoordinator {
                     .map(|e| (s.get(), (e.deletion_seq, e.upgrade_seq)))
             })
             .collect();
-        CompactionPlan {
+        Ok(CompactionPlan {
             inputs: inputs.to_vec(),
             seqs_at_select,
-        }
+        })
     }
 
     /// compaction 第 3 步：提交（草案 1 §D1.3 / OPEN-3）。
@@ -195,9 +262,14 @@ impl WriteCoordinator {
     /// 删除/补写**不会丢**：当前 deletion_vec 把后到的删除也滤掉，当前 upgrade 块也并进新段。
     /// 返回是否发生了重读合并（输入段 seq 变了），便于观测/测试。
     pub fn compaction_finish(&self, plan: &CompactionPlan) -> bool {
-        let _process = self.acquire_process_lock("write");
+        self.try_compaction_finish(plan)
+            .expect("yiTrace compaction commit failed")
+    }
+
+    pub fn try_compaction_finish(&self, plan: &CompactionPlan) -> std::io::Result<bool> {
+        let _process = self.try_acquire_process_lock("write")?;
         let _w = self.write_lock.lock().unwrap();
-        self.refresh_from_disk_locked();
+        self.refresh_from_disk_locked()?;
         let m = self.current.manifest();
 
         let mut reconciled = false;
@@ -229,7 +301,7 @@ impl WriteCoordinator {
         }
 
         let new_seg = self.alloc_segment_id();
-        self.segments.flush_to_segment(new_seg, &merged);
+        self.segments.try_flush_to_segment(new_seg, &merged)?;
         let bloom = KeyBloom::build(merged.iter().map(|r| (r.trace_id, r.span_id)), merged.len());
         self.seg_key_bloom
             .lock()
@@ -257,7 +329,7 @@ impl WriteCoordinator {
                 upgrade_seq: 0,
             },
         );
-        self.commit_and_persist(draft);
+        self.commit_and_persist(draft)?;
 
         let mut dead = self.dead_set.lock().unwrap();
         for s in &plan.inputs {
@@ -267,19 +339,25 @@ impl WriteCoordinator {
         self.rebuild_trace_rollup_current();
         self.rebuild_filter_attrs_current();
         self.persist_read_model_sidecars();
-        reconciled
+        Ok(reconciled)
     }
 
     /// 便捷：无并发窗口的一次性 compaction（begin + finish 连续）。
     pub fn commit_compaction(&self, inputs: &[SegmentId]) {
+        self.try_commit_compaction(inputs)
+            .expect("yiTrace compaction failed");
+    }
+
+    pub fn try_commit_compaction(&self, inputs: &[SegmentId]) -> std::io::Result<()> {
         let n_in = inputs.len();
-        let plan = self.compaction_begin(inputs);
-        self.compaction_finish(&plan);
+        let plan = self.try_compaction_begin(inputs)?;
+        self.try_compaction_finish(&plan)?;
         olog::log(
             olog::Level::Info,
             "compaction",
             &[("inputs", &n_in), ("version", &self.current.version())],
         );
+        Ok(())
     }
 
     /// 取 / 放一个段文件的 buffer pin（读路径扫段字节时持有，用完释放）。
@@ -304,9 +382,13 @@ impl WriteCoordinator {
     /// **非持久模式**（gc.log 不存在）：reclaim 走旧的"直接删"路径——仅靠"段 id 永不复用 + compaction
     /// 只产新段"这两个不变量兜底，没有崩溃恢复。这是纯内存 / 测试场景可接受的退化。
     pub fn reclaim(&self) -> usize {
-        let _process = self.acquire_process_lock("write");
+        self.try_reclaim().expect("yiTrace reclaim refresh failed")
+    }
+
+    pub fn try_reclaim(&self) -> std::io::Result<usize> {
+        let _process = self.try_acquire_process_lock("write")?;
         let _w = self.write_lock.lock().unwrap();
-        self.refresh_from_disk_locked();
+        self.refresh_from_disk_locked()?;
         let safe = self.current.safe_version();
         let has_process_readers = self
             .process_lock
@@ -349,7 +431,7 @@ impl WriteCoordinator {
                 &[("freed", &freed), ("remaining_dead", &dead.len())],
             );
         }
-        freed
+        Ok(freed)
     }
 
     /// 待回收 dead 资源数（可观测 / 测试用）。
@@ -360,7 +442,7 @@ impl WriteCoordinator {
     /// **在线快照备份**（§3.3 数据安全底线）。
     ///
     /// 走 pin 协议拿一致快照（持有的版本不会被 GC），把所有持久文件拷到目标目录，
-    /// 得到一个可独立 `open_durable` 恢复的一致快照。备份期间读写不阻塞（snapshot 隔离）。
+    /// 得到一个可独立 `open_durable` 恢复的一致快照。复制期间串行化 writer，读者仍可读取已有快照。
     ///
     /// 拷的文件：`segments/`（目录）+ `wal.log` + `manifest.dat` + `vecindex/`（或 `vectors.dat`）+ `gc.log`。
     /// 段文件是不可变的、manifest 是当前版本快照——拷的是那一刻的一致态。
@@ -373,7 +455,10 @@ impl WriteCoordinator {
                 "backup 需要 open_durable 的数据目录",
             )
         })?;
-        // pin 住当前版本——拷贝期间 reclaim 不会删这个版本引用的段文件。
+        // 文件集与 manifest/metadata 必须来自同一时刻；writer 锁同时阻止外部 GC。
+        let _process = self.try_acquire_process_lock("write")?;
+        let _local = self.write_lock.lock().unwrap();
+        self.refresh_from_disk_locked()?;
         let _snap = self.current.pin_snapshot();
         let version = self.current.version();
         olog::log(
@@ -393,7 +478,15 @@ impl WriteCoordinator {
                 copy_dir_recursive(&s, &dest.join(name))?;
             }
         }
-        for name in ["wal.log", "manifest.dat", "vectors.dat", "gc.log"] {
+        for name in [
+            "wal.log",
+            "wal.state",
+            "manifest.dat",
+            "metadata.dat",
+            "vectors.dat",
+            "vectors_scoped.dat",
+            "gc.log",
+        ] {
             let s = src.join(name);
             if s.exists() {
                 std::fs::copy(&s, dest.join(name))?;
@@ -522,7 +615,9 @@ impl WriteCoordinator {
                 lock.acquire_count
             ));
 
-            out.push_str("# HELP yt_process_lock_try_acquire_total embedded 进程锁 try_acquire 次数。\n");
+            out.push_str(
+                "# HELP yt_process_lock_try_acquire_total embedded 进程锁 try_acquire 次数。\n",
+            );
             out.push_str("# TYPE yt_process_lock_try_acquire_total counter\n");
             out.push_str(&format!(
                 "yt_process_lock_try_acquire_total {}\n\n",
@@ -531,16 +626,23 @@ impl WriteCoordinator {
 
             out.push_str("# HELP yt_process_lock_wait_total embedded 进程锁发生等待的次数。\n");
             out.push_str("# TYPE yt_process_lock_wait_total counter\n");
-            out.push_str(&format!("yt_process_lock_wait_total {}\n\n", lock.wait_count));
+            out.push_str(&format!(
+                "yt_process_lock_wait_total {}\n\n",
+                lock.wait_count
+            ));
 
-            out.push_str("# HELP yt_process_lock_active_waiters 当前正在等 embedded 进程锁的线程数。\n");
+            out.push_str(
+                "# HELP yt_process_lock_active_waiters 当前正在等 embedded 进程锁的线程数。\n",
+            );
             out.push_str("# TYPE yt_process_lock_active_waiters gauge\n");
             out.push_str(&format!(
                 "yt_process_lock_active_waiters {}\n\n",
                 lock.active_wait_count
             ));
 
-            out.push_str("# HELP yt_process_lock_wait_seconds_total embedded 进程锁累计等待秒数。\n");
+            out.push_str(
+                "# HELP yt_process_lock_wait_seconds_total embedded 进程锁累计等待秒数。\n",
+            );
             out.push_str("# TYPE yt_process_lock_wait_seconds_total counter\n");
             out.push_str(&format!(
                 "yt_process_lock_wait_seconds_total {}\n\n",
@@ -575,7 +677,9 @@ impl WriteCoordinator {
                 lock.reader_pin_count
             ));
 
-            out.push_str("# HELP yt_process_reader_stale_cleared_total 清掉 stale reader pin 的次数。\n");
+            out.push_str(
+                "# HELP yt_process_reader_stale_cleared_total 清掉 stale reader pin 的次数。\n",
+            );
             out.push_str("# TYPE yt_process_reader_stale_cleared_total counter\n");
             out.push_str(&format!(
                 "yt_process_reader_stale_cleared_total {}\n\n",

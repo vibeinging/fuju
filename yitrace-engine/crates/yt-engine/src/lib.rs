@@ -19,7 +19,6 @@ use yt_core::event::{EventIdentity, EventType};
 use yt_core::fold::{fold_events, FoldInput, FoldedSpan, SpanFields};
 use yt_core::ids::{SegmentId, WalLsn};
 use yt_core::manifest::{Manifest, SegState, SegmentEntry};
-use yt_core::rank::rrf_fuse;
 use yt_manifest::{Current, Snapshot};
 use yt_memtable::{MemRow, MemTable};
 use yt_wal::{Wal, WalRecord};
@@ -53,6 +52,9 @@ mod vecstore;
 mod gc_log;
 
 pub mod olog;
+
+mod event_order;
+use event_order::SpanEventOrder;
 
 mod filter_disk;
 mod filter_external_sort;

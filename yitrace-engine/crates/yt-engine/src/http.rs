@@ -316,20 +316,28 @@ impl EngineJsonApi {
         body: &str,
         tenant: Option<u64>,
     ) -> (u16, String) {
+        if let Err(err) = self.coord.try_refresh_from_disk_for_api() {
+            return internal_error(err);
+        }
         // 切掉查询串：精确路由按 base 匹配，查询参数（分页 cursor/limit）单独解析。
         let (base, query) = path.split_once('?').unwrap_or((path, ""));
         match (method, base) {
             ("POST", "/v1/ingest") => match parse_wire_batch(body) {
                 Ok(recs) => {
                     let n = recs.len();
-                    self.coord.ingest_wire_for_tenant(recs, tenant);
-                    (200, format!(r#"{{"ingested":{n}}}"#))
+                    match self.coord.try_ingest_wire_for_tenant(recs, tenant) {
+                        Ok(_) => (200, format!(r#"{{"ingested":{n}}}"#)),
+                        Err(err) => internal_error(err),
+                    }
                 }
                 Err(e) => (400, format!(r#"{{"error":"{}"}}"#, e.replace('"', "'"))),
             },
             // OTLP/HTTP 标准 trace 端点（生态入口）：OpenTelemetry / OpenInference 埋点直接 POST 到这里。
-            ("POST", "/v1/traces") => match self.coord.ingest_otlp_for_tenant(body, tenant) {
-                Ok(_) => (200, r#"{"partialSuccess":{}}"#.to_string()), // OTLP 约定的成功响应体
+            ("POST", "/v1/traces") => match crate::otlp::parse_otlp_traces(body) {
+                Ok(records) => match self.coord.try_ingest_wire_for_tenant(records, tenant) {
+                    Ok(_) => (200, r#"{"partialSuccess":{}}"#.to_string()),
+                    Err(err) => internal_error(err),
+                },
                 Err(e) => (400, format!(r#"{{"error":"{}"}}"#, e.replace('"', "'"))),
             },
             ("GET", "/v1/traces") => (200, self.traces_json(tenant)),
@@ -450,6 +458,11 @@ impl EngineJsonApi {
         // 租户来自鉴权头（X-Tenant-Id），覆盖请求体——客户端不能越权查别的租户。
         filter.tenant_id = tenant;
 
+        if !vector.is_empty() {
+            if let Err(error) = self.coord.try_prepare_vector_search() {
+                return internal_error(error);
+            }
+        }
         let snap = self.coord.pin_snapshot();
         let hits = match (!text.is_empty(), !vector.is_empty()) {
             (true, true) => self
@@ -528,3 +541,10 @@ include!("http/retention_api.rs");
 
 #[cfg(test)]
 mod tests;
+
+fn internal_error(err: impl std::fmt::Display) -> (u16, String) {
+    (
+        500,
+        format!(r#"{{"error":"{}"}}"#, json_escape(&err.to_string())),
+    )
+}

@@ -44,6 +44,8 @@ contracts, `connect(path=...)`, FastAPI router behavior, or server-mode docs:
 
 ## Usage
 
+Already computed vectors can be stored with `db.index_embedding(trace_id, span_id, vector)`. This uses the connection tenant, supports numeric or external string IDs, and accepts an optional `tenant_id` override. Repeating a vector does not create another search result; updating it replaces the old vector for that tenant and span.
+
 You can use it directly:
 
 ```python

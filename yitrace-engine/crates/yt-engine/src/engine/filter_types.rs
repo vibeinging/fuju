@@ -2,6 +2,7 @@
 /// 让向量检索能按真实查询维度（agent / 状态 / 时间）过滤，而不只按 (trace,span) id。
 #[derive(Clone, Debug, Default)]
 struct FilterAttrs {
+    event_order: SpanEventOrder,
     external_trace_id: Option<String>,
     status: Option<u8>,
     agent_name: Option<String>,

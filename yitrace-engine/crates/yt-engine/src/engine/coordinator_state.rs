@@ -215,6 +215,10 @@ impl SegFoldCache {
 /// 一个 span 在边车里的当前聚合（last-non-null 口径，与折叠一致）。用于算会话级差量。
 #[derive(Default, Clone)]
 struct SpanAgg {
+    tenant: Option<u64>,
+    event_order: SpanEventOrder,
+    /// 折叠结果没有每字段seq；下次写入先失效，再从同一快照重建，不能猜增量顺序。
+    from_fold: bool,
     session: Option<u64>,
     external_session: Option<String>,
     in_tok: u64,
@@ -251,8 +255,8 @@ struct SessionAgg {
 /// 控制台会话边车：span 级聚合 + 会话级增量聚合 + 排序结果缓存。
 #[derive(Default)]
 struct SessionIndex {
-    span: HashMap<(u64, u64), SpanAgg>,
-    sess: BTreeMap<u64, SessionAgg>,
+    span: HashMap<ScopedSpanKey, SpanAgg>,
+    sess: BTreeMap<(Option<u64>, u64), SessionAgg>,
     /// delete/upgrade 改了段（不走 index_record）→ 标脏，下次读全量重建。
     dirty: bool,
     /// 任何改动 +1；排序结果缓存据此判失效。
@@ -261,8 +265,82 @@ struct SessionIndex {
 }
 
 impl SessionIndex {
+    fn apply_record(&mut self, r: &WalRecord) {
+        if self.dirty {
+            return;
+        }
+        let key = (r.fields.tenant_id, r.trace_id, r.span_id);
+        let mut new = self.span.get(&key).cloned().unwrap_or_default();
+        if new.from_fold {
+            self.dirty = true;
+            self.cache = None;
+            return;
+        }
+        if !new.event_order.accept(r.identity.event_id().0) {
+            return;
+        }
+        let seq = r.identity.seq;
+        new.trace = r.trace_id;
+        new.tenant = r.fields.tenant_id;
+        macro_rules! field {
+            ($src:ident,$dst:ident) => {
+                if let Some(value) = r.fields.$src.as_ref() {
+                    if new.event_order.field(stringify!($src), seq) {
+                        new.$dst = value.clone();
+                    }
+                }
+            };
+        }
+        if let Some(value) = r.fields.session_id {
+            if new.event_order.field("session_id", seq) {
+                new.session = Some(value);
+            }
+        }
+        if let Some(value) = r.fields.external_session_id.as_ref() {
+            if new.event_order.field("external_session_id", seq) {
+                new.external_session = Some(value.clone());
+            }
+        }
+        field!(input_tokens, in_tok);
+        field!(output_tokens, out_tok);
+        if let Some(value) = r.fields.cache_read_tokens {
+            if new.event_order.field("cache_read_tokens", seq) {
+                new.cache_read = Some(value);
+            }
+        }
+        if let Some(value) = r.fields.cache_write_tokens {
+            if new.event_order.field("cache_write_tokens", seq) {
+                new.cache_write = Some(value);
+            }
+        }
+        if r.fields.model.is_some()
+            || r.fields.input_tokens.is_some()
+            || r.fields.output_tokens.is_some()
+            || r.fields.cache_read_tokens.is_some()
+            || r.fields.cache_write_tokens.is_some()
+        {
+            new.is_llm = true;
+        }
+        if let Some(status) = r.fields.status {
+            if new.event_order.field("status", seq) {
+                new.error = status != 0;
+            }
+        }
+        match r.identity.event_type {
+            EventType::SpanStart => new.has_start = true,
+            EventType::SpanEnd => new.has_end = true,
+            _ => {}
+        }
+        if let Some(agent) = r.fields.agent_name.as_ref() {
+            if new.event_order.field("agent_name", seq) {
+                new.agent = Some(agent.clone());
+            }
+        }
+        self.apply_span(key, new);
+    }
+
     /// 把一个 span 的"当前聚合 → 新聚合"差量应用到会话级（增量、O(1)）。
-    fn apply_span(&mut self, key: (u64, u64), new: SpanAgg) {
+    fn apply_span(&mut self, key: ScopedSpanKey, new: SpanAgg) {
         let old = self.span.get(&key).cloned().unwrap_or_default();
         if old.session != new.session {
             if let Some(os) = old.session {
@@ -273,22 +351,19 @@ impl SessionIndex {
             }
         } else if let Some(s) = new.session {
             // 同会话：只动 token / error 差量。
-            let e = self.sess.entry(s).or_default();
+            let e = self.sess.entry((new.tenant, s)).or_default();
             if e.external_session.is_none() {
                 e.external_session = new.external_session.clone();
             }
             e.in_tok = (e.in_tok as i64 + new.in_tok as i64 - old.in_tok as i64).max(0) as u64;
             e.out_tok = (e.out_tok as i64 + new.out_tok as i64 - old.out_tok as i64).max(0) as u64;
-            e.cache_read = (e.cache_read as i128
-                + new.cache_read.unwrap_or(0) as i128
+            e.cache_read = (e.cache_read as i128 + new.cache_read.unwrap_or(0) as i128
                 - old.cache_read.unwrap_or(0) as i128)
                 .max(0) as u64;
-            e.cache_write = (e.cache_write as i128
-                + new.cache_write.unwrap_or(0) as i128
+            e.cache_write = (e.cache_write as i128 + new.cache_write.unwrap_or(0) as i128
                 - old.cache_write.unwrap_or(0) as i128)
                 .max(0) as u64;
-            e.cache_read_reported = (e.cache_read_reported as i64
-                + new.cache_read.is_some() as i64
+            e.cache_read_reported = (e.cache_read_reported as i64 + new.cache_read.is_some() as i64
                 - old.cache_read.is_some() as i64)
                 .max(0) as usize;
             e.cache_write_reported = (e.cache_write_reported as i64
@@ -299,8 +374,7 @@ impl SessionIndex {
                 (e.total_llm as i64 + new.is_llm as i64 - old.is_llm as i64).max(0) as usize;
             e.error_spans =
                 (e.error_spans as i64 + new.error as i64 - old.error as i64).max(0) as usize;
-            e.running_spans = (e.running_spans as i64
-                + (new.has_start && !new.has_end) as i64
+            e.running_spans = (e.running_spans as i64 + (new.has_start && !new.has_end) as i64
                 - (old.has_start && !old.has_end) as i64)
                 .max(0) as usize;
             if e.title.is_empty() {
@@ -315,7 +389,7 @@ impl SessionIndex {
     }
 
     fn add(&mut self, sid: u64, s: &SpanAgg) {
-        let e = self.sess.entry(sid).or_default();
+        let e = self.sess.entry((s.tenant, sid)).or_default();
         e.in_tok += s.in_tok;
         e.out_tok += s.out_tok;
         e.cache_read += s.cache_read.unwrap_or(0);
@@ -341,7 +415,7 @@ impl SessionIndex {
     }
 
     fn sub(&mut self, sid: u64, s: &SpanAgg) {
-        if let Some(e) = self.sess.get_mut(&sid) {
+        if let Some(e) = self.sess.get_mut(&(s.tenant, sid)) {
             e.in_tok = e.in_tok.saturating_sub(s.in_tok);
             e.out_tok = e.out_tok.saturating_sub(s.out_tok);
             e.cache_read = e.cache_read.saturating_sub(s.cache_read.unwrap_or(0));
@@ -367,6 +441,9 @@ impl SessionIndex {
         self.sess.clear();
         for s in spans {
             let sa = SpanAgg {
+                event_order: SpanEventOrder::default(),
+                from_fold: true,
+                tenant: s.tenant_id,
                 session: s.session_id,
                 external_session: s.external_session_id.clone(),
                 in_tok: s.input_tokens.unwrap_or(0),
@@ -387,7 +464,7 @@ impl SessionIndex {
             if let Some(sid) = sa.session {
                 self.add(sid, &sa);
             }
-            self.span.insert((s.trace_id, s.span_id), sa);
+            self.span.insert((s.tenant_id, s.trace_id, s.span_id), sa);
         }
         self.dirty = false;
         self.ver += 1;
@@ -405,10 +482,10 @@ impl SessionIndex {
             .sess
             .iter()
             .map(|(sid, a)| ConsoleSession {
-                session_id: *sid,
+                session_id: sid.1,
                 external_session_id: a.external_session.clone(),
                 title: if a.title.is_empty() {
-                    format!("会话 {sid}")
+                    format!("会话 {}", sid.1)
                 } else {
                     a.title.clone()
                 },

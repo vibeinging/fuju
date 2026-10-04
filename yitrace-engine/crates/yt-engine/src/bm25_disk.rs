@@ -264,6 +264,14 @@ impl DiskBm25Cache {
         Some(self.directory.get(token)?.blocks.clone())
     }
 
+    pub(crate) fn set_cache_budget(&mut self, budget: usize) {
+        self.cache_budget = budget;
+        if self.cached_bytes > budget {
+            self.cached.clear();
+            self.lru.clear();
+            self.cached_bytes = 0;
+        }
+    }
     pub(crate) fn load_block(&mut self, token: &str, block: usize) -> Option<Arc<Vec<Posting>>> {
         let key = CacheKey::Block {
             token: token.to_owned(),

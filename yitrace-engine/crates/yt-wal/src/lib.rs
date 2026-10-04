@@ -69,6 +69,8 @@ enum Backing {
 pub struct Wal {
     next_lsn: u64,
     backing: Backing,
+    /// 写入或同步失败后，文件尾是否提交已不确定，必须重开恢复才能再写。
+    write_failed: bool,
 }
 
 impl Default for Wal {
@@ -83,6 +85,7 @@ impl Wal {
         Self {
             next_lsn: 1,
             backing: Backing::Mem(Vec::new()),
+            write_failed: false,
         }
     }
 
@@ -90,13 +93,16 @@ impl Wal {
     pub fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let state_path = path.with_extension("state");
-        let file_len = std::fs::metadata(&path)
-            .map(|meta| meta.len() as usize)
-            .unwrap_or(0);
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&path)?;
+        let file_len = file.metadata()?.len() as usize;
         let checkpoint = load_wal_state(&state_path)
             .filter(|state| state.scanned_len <= file_len)
             .unwrap_or_default();
-        let existing = read_file_from(&path, checkpoint.scanned_len).unwrap_or_default();
+        let existing = read_file_from(&path, checkpoint.scanned_len)?;
         let (frames, consumed) = parse_frames_with_consumed(&existing);
         let scanned_len = checkpoint.scanned_len.saturating_add(consumed);
         // checkpoint 之前的帧已经随 manifest flush 持久化；这里只解码 checkpoint 后的尾部。
@@ -104,13 +110,14 @@ impl Wal {
             .last()
             .map(|(first, recs)| first + (recs.len() as u64).max(1))
             .unwrap_or(checkpoint.next_lsn.max(1));
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&path)?;
+        // 解析停止处之后是不完整帧；若继续 append，其后的成功提交也会被下次恢复忽略。
+        if scanned_len < file_len {
+            file.set_len(scanned_len as u64)?;
+            file.sync_data()?;
+        }
         Ok(Self {
             next_lsn,
+            write_failed: false,
             backing: Backing::File {
                 file,
                 path,
@@ -124,6 +131,25 @@ impl Wal {
 
     /// 追加一批并提交（组提交）。文件模式 fsync 后才返回 → 之后调用方才回 ack。
     pub fn append_committed(&mut self, records: Vec<WalRecord>) -> WalLsn {
+        self.try_append_committed(records)
+            .expect("yiTrace WAL append failed")
+    }
+
+    pub fn try_append_committed(&mut self, records: Vec<WalRecord>) -> std::io::Result<WalLsn> {
+        self.try_append_committed_records(&records)
+    }
+
+    /// 文件后端只需借用待编码的记录，避免引擎为了先写 WAL 复制整批大文本。
+    pub fn try_append_committed_records(
+        &mut self,
+        records: &[WalRecord],
+    ) -> std::io::Result<WalLsn> {
+        if self.write_failed {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "WAL write previously failed; reopen before writing",
+            ));
+        }
         let first = self.next_lsn;
         let n = records.len() as u64;
         match &mut self.backing {
@@ -131,7 +157,7 @@ impl Wal {
                 let crc = crc32_bytes(&encode_batch(&records));
                 batches.push(MemBatch {
                     first_lsn: first,
-                    records,
+                    records: records.to_vec(),
                     crc32: crc,
                     committed: true,
                 });
@@ -147,21 +173,28 @@ impl Wal {
                 frame.extend_from_slice(&payload);
                 frame.extend_from_slice(&crc.to_le_bytes());
                 frame.push(1u8); // commit marker
-                let _ = file.write_all(&frame);
-                let _ = file.sync_data(); // ★ fsync：落盘后才算 ack
+                if let Err(err) = file.write_all(&frame).and_then(|_| file.sync_data()) {
+                    self.write_failed = true;
+                    return Err(err);
+                }
                 *scanned_len = scanned_len.saturating_add(frame.len());
             }
         }
         self.next_lsn += n.max(1);
-        WalLsn::new(self.next_lsn - 1)
+        Ok(WalLsn::new(self.next_lsn - 1))
     }
 
     /// 崩溃重放：返回「已 ack」批次里 LSN 在 `from`(不含) 之后的每条记录，带其 LSN。
     /// 文件模式重新读盘解析；撕裂尾被丢弃。返回 owned（文件模式无法借用）。
     pub fn replay_after(&self, from: WalLsn) -> Vec<(u64, WalRecord)> {
+        self.try_replay_after(from)
+            .expect("yiTrace WAL replay failed")
+    }
+
+    pub fn try_replay_after(&self, from: WalLsn) -> std::io::Result<Vec<(u64, WalRecord)>> {
         let from = from.get();
         if from >= self.committed_tail().get() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let mut out = Vec::new();
         let mut push = |first: u64, recs: &[WalRecord]| {
@@ -191,13 +224,13 @@ impl Wal {
                 } else {
                     0
                 };
-                let bytes = read_file_from(path, offset).unwrap_or_default();
+                let bytes = read_file_from(path, offset)?;
                 for (first, recs) in parse_frames(&bytes) {
                     push(first, &recs);
                 }
             }
         }
-        out
+        Ok(out)
     }
 
     pub fn committed_tail(&self) -> WalLsn {
@@ -241,34 +274,67 @@ impl Wal {
         self.refresh_from_disk_after(WalLsn::new(u64::MAX)).0
     }
 
+    pub fn try_refresh_from_disk(&mut self) -> std::io::Result<WalLsn> {
+        self.try_refresh_from_disk_after(WalLsn::new(u64::MAX))
+            .map(|(tail, _)| tail)
+    }
+
     /// 文件模式增量刷新：只解析上次已确认帧之后的新字节，并返回 `from` 之后的新记录。
     /// 如果文件被截断或本地扫描位置失效，则退回全量扫描。
     pub fn refresh_from_disk_after(&mut self, from: WalLsn) -> (WalLsn, Vec<(u64, WalRecord)>) {
+        self.try_refresh_from_disk_after(from)
+            .expect("yiTrace WAL refresh failed")
+    }
+
+    /// 调用方须串行化该文件的所有 writer；失败过的 handle 不自动确认未知提交。
+    pub fn try_refresh_from_disk_after(
+        &mut self,
+        from: WalLsn,
+    ) -> std::io::Result<(WalLsn, Vec<(u64, WalRecord)>)> {
+        if self.write_failed {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "WAL write previously failed; reopen before refresh",
+            ));
+        }
         let from = from.get();
         let mut changed = Vec::new();
         if let Backing::File {
-            path, scanned_len, ..
+            file,
+            path,
+            scanned_len,
+            checkpoint_len,
+            checkpoint_lsn,
+            ..
         } = &mut self.backing
         {
-            let file_len = std::fs::metadata(&*path)
-                .map(|m| m.len() as usize)
-                .unwrap_or(0);
+            let file_len = std::fs::metadata(&*path)?.len() as usize;
             if file_len == *scanned_len {
-                return (self.committed_tail(), changed);
+                return Ok((self.committed_tail(), changed));
             }
 
             if file_len < *scanned_len {
-                let existing = std::fs::read(&*path).unwrap_or_default();
+                let existing = std::fs::read(&*path)?;
                 let (frames, consumed) = parse_frames_with_consumed(&existing);
                 *scanned_len = consumed;
                 self.next_lsn = update_next_lsn_from_frames(&frames);
+                *checkpoint_len = 0;
+                *checkpoint_lsn = 0;
+                if consumed < file_len {
+                    file.set_len(consumed as u64)?;
+                    file.sync_data()?;
+                }
                 collect_after(&mut changed, from, &frames);
-                return (self.committed_tail(), changed);
+                return Ok((self.committed_tail(), changed));
             }
 
-            let existing = read_file_from(path, *scanned_len).unwrap_or_default();
+            let existing = read_file_from(path, *scanned_len)?;
             let (frames, consumed) = parse_frames_with_consumed(&existing);
             *scanned_len = (*scanned_len).saturating_add(consumed);
+            if *scanned_len < file_len {
+                file.set_len(*scanned_len as u64)?;
+                file.sync_data()?;
+            }
             if let Some(next) = frames
                 .last()
                 .map(|(first, recs)| first + (recs.len() as u64).max(1))
@@ -277,7 +343,7 @@ impl Wal {
             }
             collect_after(&mut changed, from, &frames);
         }
-        (self.committed_tail(), changed)
+        Ok((self.committed_tail(), changed))
     }
 }
 
@@ -1313,5 +1379,55 @@ mod tests {
             .collect();
         assert_eq!(seqs, vec![1], "撕裂的第二帧被丢弃,第一帧完好");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn durability_regression_append_after_torn_tail_survives_reopen() {
+        let path = temp_path();
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            wal.append_committed(vec![rec("first", 1)]);
+        }
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[0u8; 7])
+            .unwrap();
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            assert_eq!(wal.append_committed(vec![rec("second", 2)]).get(), 2);
+        }
+        let wal = Wal::open(&path).unwrap();
+        assert_eq!(
+            wal.replay_after(WalLsn::new(0))
+                .iter()
+                .map(|(lsn, _)| *lsn)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn durability_regression_failed_write_does_not_advance_tail() {
+        let path = temp_path();
+        let mut wal = Wal::open(&path).unwrap();
+        if let Backing::File { file, .. } = &mut wal.backing {
+            *file = File::open(&path).unwrap();
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            wal.append_committed(vec![rec("failed", 1)])
+        }));
+        assert!(
+            result.is_err(),
+            "failed write must be reported rather than acknowledged"
+        );
+        assert_eq!(wal.committed_tail().get(), 0);
+        assert!(Wal::open(&path)
+            .unwrap()
+            .replay_after(WalLsn::new(0))
+            .is_empty());
+        let _ = std::fs::remove_file(path);
     }
 }

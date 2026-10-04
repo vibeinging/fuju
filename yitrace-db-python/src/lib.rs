@@ -47,7 +47,7 @@ impl NativeYiTraceDb {
                         dir.display()
                     ))
                 })?;
-            coord.recover();
+            coord.try_recover().map_err(|e| py_runtime_err(format!("recover yiTrace failed: {e}")))?;
             Ok::<_, PyErr>(coord)
         })?;
         let api = EngineJsonApi::new(Arc::clone(&coord));
@@ -84,10 +84,43 @@ impl NativeYiTraceDb {
         }
     }
 
+    #[pyo3(signature = (trace_id, span_id, embedding, tenant_id = None))]
+    pub fn index_embedding(
+        &self,
+        py: Python<'_>,
+        trace_id: String,
+        span_id: String,
+        embedding: Vec<f32>,
+        tenant_id: Option<String>,
+    ) -> PyResult<()> {
+        self.ensure_open()?;
+        let tenant = parse_tenant_id(tenant_id)?;
+        fn parse_id(value: &str) -> PyResult<u64> {
+            if value.trim().is_empty() {
+                return Err(py_value_err("trace/span id must not be empty"));
+            }
+            Ok(value.trim().parse().unwrap_or_else(|_| {
+                value
+                    .trim()
+                    .as_bytes()
+                    .iter()
+                    .fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+                        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+                    })
+            }))
+        }
+        let trace = parse_id(&trace_id)?;
+        let span = parse_id(&span_id)?;
+        let coord = Arc::clone(&self.coord);
+        py.detach(move || coord.index_embedding_for_tenant(tenant, trace, span, embedding))
+            .map_err(|e| py_runtime_err(e.to_string()))
+    }
+
     pub fn flush(&self, py: Python<'_>) -> PyResult<()> {
         self.ensure_open()?;
         let coord = Arc::clone(&self.coord);
-        py.detach(move || coord.flush_memtable());
+        py.detach(move || coord.try_flush_memtable())
+            .map_err(|e| py_runtime_err(format!("flush yiTrace failed: {e}")))?;
         Ok(())
     }
 
@@ -101,7 +134,8 @@ impl NativeYiTraceDb {
             return Ok(());
         }
         let coord = Arc::clone(&self.coord);
-        py.detach(move || coord.flush_memtable());
+        py.detach(move || coord.try_flush_memtable())
+            .map_err(|e| py_runtime_err(format!("flush yiTrace failed: {e}")))?;
         self.closed = true;
         Ok(())
     }
@@ -118,7 +152,9 @@ impl NativeYiTraceDb {
 impl Drop for NativeYiTraceDb {
     fn drop(&mut self) {
         if !self.closed {
-            self.coord.flush_memtable();
+            if let Err(err) = self.coord.try_flush_memtable() {
+                eprintln!("yiTrace close flush failed: {err}");
+            }
             self.closed = true;
         }
     }

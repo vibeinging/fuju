@@ -49,9 +49,9 @@ impl WriteCoordinator {
         let _open_guard = process_lock
             .acquire("open")
             .map_err(|e| std::io::Error::new(e.kind(), format!("open durable lock failed: {e}")))?;
-        let _write_guard = process_lock
-            .acquire("write")
-            .map_err(|e| std::io::Error::new(e.kind(), format!("open durable write lock failed: {e}")))?;
+        let _write_guard = process_lock.acquire("write").map_err(|e| {
+            std::io::Error::new(e.kind(), format!("open durable write lock failed: {e}"))
+        })?;
         let lock_us = lock_started.elapsed().as_micros() as u64;
         let storage_started = std::time::Instant::now();
         let segments = Arc::new(FileSegmentStore::open(dir.join("segments"))?);
@@ -62,7 +62,7 @@ impl WriteCoordinator {
         let gc_log_path = dir.join("gc.log");
         // 有持久 manifest 就从它恢复段集合与 id 计数器；否则从空开始。
         let manifest_started = std::time::Instant::now();
-        let (manifest, next_seg, next_chunk) = match persist::load(&manifest_path) {
+        let (manifest, next_seg, next_chunk) = match persist::try_load(&manifest_path)? {
             Some(s) => (s.manifest, s.next_segment_id, s.next_chunk_id),
             None => (Manifest::empty(), 1, 1),
         };
@@ -232,28 +232,16 @@ impl WriteCoordinator {
         })
     }
 
-    /// commit 后若开了持久化,原子写 manifest（含 id 计数器）。崩溃在写 manifest 前 = 退回上个 manifest
-    /// （那次 commit 的段文件成孤儿,无害,等回收或忽略）；写后 = 新状态生效。两边都不脏读。
-    fn persist_manifest(&self) {
-        let Some(path) = &self.manifest_path else {
-            return;
+    /// 元数据写失败必须传回调用方；调用方持 writer 锁并恢复未提交的内存变更。
+    fn persist_metadata(&self) -> std::io::Result<()> {
+        let Some(path) = &self.metadata_path else {
+            return Ok(());
         };
-        let state = persist::PersistedState {
-            manifest: (*self.current.manifest()).clone(),
-            next_segment_id: *self.next_segment_id.lock().unwrap(),
-            next_chunk_id: *self.next_chunk_id.lock().unwrap(),
-        };
-        let _ = persist::save(path, &state);
-        // 提交点：向量索引批量刷盘（append 期间只写不刷，靠这里持久；删除少、append 多场景的吞吐取舍）。
-        self.graph.flush();
+        metadata::save(path, &self.capture_metadata_state())
     }
 
-    /// 元数据账本独立落盘。失败不影响 trace 写入主链路，但下一次接口返回前会保留在内存中。
-    fn persist_metadata(&self) {
-        let Some(path) = &self.metadata_path else {
-            return;
-        };
-        let state = metadata::MetadataState {
+    fn capture_metadata_state(&self) -> metadata::MetadataState {
+        metadata::MetadataState {
             annotations: self.annotations.lock().unwrap().clone(),
             dataset_associations: self.dataset_associations.lock().unwrap().clone(),
             retention_audits: self.retention_audits.lock().unwrap().clone(),
@@ -262,8 +250,19 @@ impl WriteCoordinator {
             next_dataset_association_id: *self.next_dataset_association_id.lock().unwrap(),
             next_retention_audit_id: *self.next_retention_audit_id.lock().unwrap(),
             next_retention_policy_id: *self.next_retention_policy_id.lock().unwrap(),
-        };
-        let _ = metadata::save(path, &state);
+        }
+    }
+
+    fn restore_metadata_state(&self, state: metadata::MetadataState) {
+        *self.annotations.lock().unwrap() = state.annotations;
+        *self.dataset_associations.lock().unwrap() = state.dataset_associations;
+        *self.retention_audits.lock().unwrap() = state.retention_audits;
+        *self.retention_policies.lock().unwrap() = state.retention_policies;
+        *self.next_annotation_id.lock().unwrap() = state.next_annotation_id;
+        *self.next_dataset_association_id.lock().unwrap() = state.next_dataset_association_id;
+        *self.next_retention_audit_id.lock().unwrap() = state.next_retention_audit_id;
+        *self.next_retention_policy_id.lock().unwrap() = state.next_retention_policy_id;
+        self.rebuild_metadata_index();
     }
 
     fn rebuild_metadata_index(&self) {
@@ -279,40 +278,52 @@ impl WriteCoordinator {
         );
     }
 
+    fn try_acquire_process_lock(
+        &self,
+        name: &str,
+    ) -> std::io::Result<Option<process_lock::ProcessLockGuard>> {
+        self.process_lock
+            .as_ref()
+            .map(|mgr| mgr.acquire(name))
+            .transpose()
+    }
+
     fn acquire_process_lock(&self, name: &str) -> Option<process_lock::ProcessLockGuard> {
-        self.process_lock.as_ref().map(|mgr| {
-            mgr.acquire(name)
-                .unwrap_or_else(|e| panic!("yiTrace {name} process lock failed: {e}"))
-        })
+        self.try_acquire_process_lock(name)
+            .expect("yiTrace process lock failed")
+    }
+
+    fn try_refresh_from_disk_for_read(&self) -> std::io::Result<()> {
+        let _process = self.try_acquire_process_lock("write")?;
+        let _local = self.write_lock.lock().unwrap();
+        self.refresh_from_disk_locked()
     }
 
     fn refresh_from_disk_for_read(&self) {
-        if self.manifest_path.is_none() {
-            return;
-        }
-        let Ok(_local) = self.write_lock.try_lock() else {
-            return;
-        };
-        let Some(mgr) = self.process_lock.as_ref() else {
-            return;
-        };
-        let Ok(Some(_process)) = mgr.try_acquire("write") else {
-            return;
-        };
-        self.refresh_from_disk_locked();
+        self.try_refresh_from_disk_for_read()
+            .expect("yiTrace read refresh failed");
     }
 
-    fn refresh_from_disk_locked(&self) {
+    pub(crate) fn try_refresh_from_disk_for_api(&self) -> std::io::Result<()> {
+        self.try_refresh_from_disk_for_read()
+    }
+
+    fn refresh_from_disk_locked(&self) -> std::io::Result<()> {
         if self.manifest_path.is_none() {
-            return;
+            return Ok(());
         }
-        let persisted = self.manifest_path.as_ref().and_then(persist::load);
+        self.graph.reload_if_changed_checked()?;
+        // 兼容注入内存 graph 的旧持久化路径，向量写入可独立于 manifest/WAL。
+        if self.vector_path.is_some() {
+            self.reload_legacy_vectors_locked()?;
+        }
+        let persisted = persist::try_load(self.manifest_path.as_ref().unwrap())?;
         let old_tail = self.current.committed_tail();
         let (tail, tail_records) = self
             .wal
             .lock()
             .unwrap()
-            .refresh_from_disk_after(WalLsn::new(old_tail));
+            .try_refresh_from_disk_after(WalLsn::new(old_tail))?;
         let disk_version = persisted
             .as_ref()
             .map(|s| s.manifest.version.get())
@@ -321,8 +332,8 @@ impl WriteCoordinator {
             .as_ref()
             .map(|s| s.manifest.memtable_watermark.get())
             .unwrap_or(0);
-        let manifest_changed =
-            disk_version != self.current.version() || disk_watermark != self.current.memtable_watermark();
+        let manifest_changed = disk_version != self.current.version()
+            || disk_watermark != self.current.memtable_watermark();
         self.refresh_metadata_from_disk_locked();
         if !manifest_changed {
             if tail.get() != old_tail {
@@ -333,14 +344,15 @@ impl WriteCoordinator {
                 self.apply_wal_tail_records_locked(tail_records);
                 self.current.advance_committed_tail(tail);
             }
-            return;
+            return Ok(());
         }
         if let Some(state) = persisted {
             self.current.replace_from_disk(state.manifest);
             *self.next_segment_id.lock().unwrap() = state.next_segment_id;
             *self.next_chunk_id.lock().unwrap() = state.next_chunk_id;
         }
-        self.rebuild_volatile_from_current_locked();
+        self.rebuild_volatile_from_current_locked()?;
+        Ok(())
     }
 
     fn apply_wal_tail_records_locked(&self, rows: Vec<(u64, WalRecord)>) {
@@ -354,6 +366,9 @@ impl WriteCoordinator {
                 continue;
             }
             self.index_record(&r);
+            if mt.newest_lsn().is_some_and(|last| lsn <= last) {
+                continue;
+            }
             mt.append(MemRow {
                 commit_lsn: lsn,
                 trace_id: r.trace_id,
@@ -383,13 +398,17 @@ impl WriteCoordinator {
         self.rebuild_metadata_index();
     }
 
-    fn clear_volatile_indexes_locked(&self) {
-        *self.memtable.lock().unwrap() = MemTable::new();
+    fn clear_volatile_indexes_locked(&self) -> std::io::Result<()> {
+        // 外部 flush 后仍有旧 snapshot 读取旧 memtable 区间，按所有本地读者水位保留。
+        self.memtable
+            .lock()
+            .unwrap()
+            .evict_up_to(WalLsn::new(self.current.min_retained_watermark()));
         self.clear_segment_scan_indexes_locked();
         let durable = self.manifest_path.is_some();
         *self.segment_scan_indexes_stale.lock().unwrap() = durable;
         self.graph.clear();
-        self.graph.reload();
+        self.graph.reload_checked()?;
         *self.filter_attrs.lock().unwrap() = FilterAttrsIndex::default();
         *self.trace_rollup.lock().unwrap() = TraceAggregateRollupIndex::default();
         *self.read_model_load_state.lock().unwrap() = if durable {
@@ -397,6 +416,7 @@ impl WriteCoordinator {
         } else {
             ReadModelLoadState::ready()
         };
+        Ok(())
     }
 
     fn clear_segment_scan_indexes_locked(&self) {
@@ -407,8 +427,8 @@ impl WriteCoordinator {
         *self.seg_key_bloom_load_failed_for.lock().unwrap() = None;
     }
 
-    fn rebuild_volatile_from_current_locked(&self) -> usize {
-        self.clear_volatile_indexes_locked();
+    fn rebuild_volatile_from_current_locked(&self) -> std::io::Result<usize> {
+        self.clear_volatile_indexes_locked()?;
         let m = self.current.manifest();
         let segment_derived_dirty = m
             .segments
@@ -420,8 +440,8 @@ impl WriteCoordinator {
         // delete/upgrade 只会让缓存失效，不影响主数据正确性，惰性加载时会自动走段重建。
         *self.segment_scan_indexes_stale.lock().unwrap() = self.manifest_path.is_some();
         self.session_idx.lock().unwrap().dirty = true;
-        self.reload_legacy_vectors_locked();
-        self.replay_wal_tail_into_memtable_locked();
+        self.reload_legacy_vectors_locked()?;
+        self.replay_wal_tail_into_memtable_locked()?;
         olog::log(
             olog::Level::Info,
             "recover_lazy_ready",
@@ -430,25 +450,35 @@ impl WriteCoordinator {
                 ("derived_dirty", &segment_derived_dirty),
             ],
         );
-        0
+        Ok(0)
     }
 
-    fn reload_legacy_vectors_locked(&self) {
+    fn reload_legacy_vectors_locked(&self) -> std::io::Result<()> {
         if let Some(p) = &self.vector_path {
+            self.graph.clear();
             for ((t, s), v) in vecstore::load(p) {
-                self.graph.index_embedding(t, s, v);
+                self.graph.index_embedding_scoped(None, t, s, v)?;
+            }
+            for ((tenant, t, s), vector) in
+                vecstore::load_scoped(p.with_file_name("vectors_scoped.dat"))
+            {
+                self.graph.index_embedding_scoped(tenant, t, s, vector)?;
             }
         }
+        Ok(())
     }
 
-    fn replay_wal_tail_into_memtable_locked(&self) {
+    fn replay_wal_tail_into_memtable_locked(&self) -> std::io::Result<()> {
         let (records, tail) = {
             let wal = self.wal.lock().unwrap();
             (
-                wal.replay_after(WalLsn::new(self.current.memtable_watermark())),
+                wal.try_replay_after(WalLsn::new(self.current.memtable_watermark()))?,
                 wal.committed_tail(),
             )
         };
+        // 恢复时 Current 的初始尾为 0；先在 writer 临界区内设置合法快照上界，
+        // 使派生模型从 (manifest watermark, committed tail] 读取时不会得到倒置区间。
+        self.current.advance_committed_tail(tail);
         if !records.is_empty() {
             // WAL tail 必须叠加到完整派生索引上，不能先写空索引再被持久 cache 覆盖。
             self.ensure_all_read_models_current_locked();
@@ -456,6 +486,9 @@ impl WriteCoordinator {
         let mut mt = self.memtable.lock().unwrap();
         for (lsn, r) in records {
             self.index_record(&r);
+            if mt.newest_lsn().is_some_and(|last| lsn <= last) {
+                continue;
+            }
             mt.append(MemRow {
                 commit_lsn: lsn,
                 trace_id: r.trace_id,
@@ -466,29 +499,30 @@ impl WriteCoordinator {
             });
         }
         self.current.advance_committed_tail(tail);
+        Ok(())
     }
 
     fn ensure_segment_scan_indexes_current(&self) {
+        self.try_ensure_segment_scan_indexes_current()
+            .expect("yiTrace index refresh failed");
+    }
+
+    fn try_ensure_segment_scan_indexes_current(&self) -> std::io::Result<()> {
         if !*self.segment_scan_indexes_stale.lock().unwrap() {
-            return;
+            return Ok(());
         }
-        let _process = self.acquire_process_lock("write");
+        let _process = self.try_acquire_process_lock("write")?;
         let _local = self.write_lock.lock().unwrap();
-        self.refresh_from_disk_locked();
-        if !*self.segment_scan_indexes_stale.lock().unwrap() {
-            return;
-        }
+        self.refresh_from_disk_locked()?;
         self.ensure_segment_scan_indexes_current_locked();
+        Ok(())
     }
 
     /// 单 Span 点查只需要知道目标 key 可能位于哪些 segment。
     /// clean reopen 时先按当前快照加载小型 bloom sidecar，避免为了定位一个 Span 对所有段做完整 CRC；
     /// BM25 仍保持 deferred，不把全文索引的冷启动成本带进详情读取。
     fn ensure_seg_key_bloom_for_manifest(&self, manifest: &Manifest) -> FoldQueryStats {
-        let manifest_key = (
-            manifest.version.get(),
-            manifest.memtable_watermark.get(),
-        );
+        let manifest_key = (manifest.version.get(), manifest.memtable_watermark.get());
         let covers_manifest = || {
             let blooms = self.seg_key_bloom.lock().unwrap();
             manifest
@@ -527,20 +561,27 @@ impl WriteCoordinator {
     }
 
     fn rebuild_and_persist_seg_key_bloom_current(&self) -> (bool, FoldQueryStats) {
+        self.try_rebuild_and_persist_seg_key_bloom_current()
+            .expect("yiTrace bloom refresh failed")
+    }
+
+    fn try_rebuild_and_persist_seg_key_bloom_current(
+        &self,
+    ) -> std::io::Result<(bool, FoldQueryStats)> {
         let mut stats = FoldQueryStats {
             fallback_reason: Some("segment_bloom_migrated".to_string()),
             ..FoldQueryStats::default()
         };
         let Some(path) = &self.seg_key_bloom_path else {
-            return (false, stats);
+            return Ok((false, stats));
         };
-        let _process = self.acquire_process_lock("write");
+        let _process = self.try_acquire_process_lock("write")?;
         let _local = self.write_lock.lock().unwrap();
-        self.refresh_from_disk_locked();
+        self.refresh_from_disk_locked()?;
         let manifest = self.current.manifest();
         let mut rebuilt = HashMap::new();
         if rebuilt.try_reserve(manifest.segments.len()).is_err() {
-            return (false, stats);
+            return Ok((false, stats));
         }
         for entry in manifest.segments.values() {
             let scan = self.segments.scan_records_with_stats(entry.segment_id);
@@ -550,7 +591,7 @@ impl WriteCoordinator {
             // 已提交的 segment 不会为空；空结果说明数据段缺失或校验失败，此时不能生成会有
             // 假阴性的 bloom，只能保留逐段点查回退。
             if scan.rows.is_empty() {
-                return (false, stats);
+                return Ok((false, stats));
             }
             rebuilt.insert(
                 entry.segment_id.get(),
@@ -575,7 +616,7 @@ impl WriteCoordinator {
                 "segment_bloom_cache_migrate_failed",
                 &[("error", &err.to_string())],
             );
-            return (false, stats);
+            return Ok((false, stats));
         }
         self.seg_key_bloom.lock().unwrap().extend(rebuilt);
         olog::log(
@@ -587,7 +628,7 @@ impl WriteCoordinator {
                 ("watermark", &manifest.memtable_watermark.get()),
             ],
         );
-        (true, stats)
+        Ok((true, stats))
     }
 
     fn ensure_segment_scan_indexes_current_locked(&self) {
@@ -630,6 +671,10 @@ impl WriteCoordinator {
         self.clear_segment_scan_indexes_locked();
         let mut scanned = 0usize;
         let m = self.current.manifest();
+        let has_patches = m
+            .segments
+            .values()
+            .any(|entry| entry.deletion_seq > 0 || entry.upgrade_ref.is_some());
         for entry in m.segments.values() {
             let recs = self.segments.scan_records(entry.segment_id);
             scanned += 1;
@@ -646,39 +691,64 @@ impl WriteCoordinator {
 
         let mem_rows = {
             let mt = self.memtable.lock().unwrap();
-            mt.iter()
-                .map(|r| WalRecord {
-                    trace_id: r.trace_id,
-                    span_id: r.span_id,
-                    ts: r.ts,
-                    identity: r.identity.clone(),
-                    fields: r.fields.clone(),
-                })
-                .collect::<Vec<_>>()
+            mt.read_range(
+                WalLsn::new(self.current.memtable_watermark()),
+                WalLsn::new(self.current.committed_tail()),
+            )
+            .map(|r| WalRecord {
+                trace_id: r.trace_id,
+                span_id: r.span_id,
+                ts: r.ts,
+                identity: r.identity.clone(),
+                fields: r.fields.clone(),
+            })
+            .collect::<Vec<_>>()
         };
         for r in &mem_rows {
             self.index_record_without_rollup_and_filter_attrs(r);
         }
+        if has_patches {
+            // 原始事件只用于建不可变 key 目录；删除和补写后的文本必须按可见 span 重建。
+            self.rebuild_bm25_current();
+            self.session_idx.lock().unwrap().dirty = true;
+        }
         scanned
     }
 
-    /// 提交新 manifest 版本并（若开了持久化）落盘。所有 commit 走这里,保证段集合改动都持久。
-    fn commit_and_persist(&self, draft: Manifest) {
+    /// 先落盘草案再发布，普通写失败保留之前的 manifest，不允许推进水位或删除状态。
+    fn commit_and_persist(&self, draft: Manifest) -> std::io::Result<()> {
+        self.graph.flush_checked()?;
+        if let Some(path) = &self.manifest_path {
+            persist::save(
+                path,
+                &persist::PersistedState {
+                    manifest: draft.clone(),
+                    next_segment_id: *self.next_segment_id.lock().unwrap(),
+                    next_chunk_id: *self.next_chunk_id.lock().unwrap(),
+                },
+            )?;
+        }
         self.current.commit(draft);
-        self.persist_manifest();
+        Ok(())
     }
 
-    /// 读者入口：pin 一个一致快照（委托给 yt-manifest）。
+    /// 兼容入口的 panic 在 try 方法释放锁之后发生，避免普通 I/O 失败污染互斥锁。
     pub fn pin_snapshot(&self) -> Snapshot {
-        self.refresh_from_disk_for_read();
+        self.try_pin_snapshot().expect("yiTrace reader pin failed")
+    }
+
+    /// 刷新、外部 pin、本地 pin 在同一个 writer 临界区内完成，GC 无法穿过三者之间。
+    pub fn try_pin_snapshot(&self) -> std::io::Result<Snapshot> {
+        let _process = self.try_acquire_process_lock("write")?;
+        let _local = self.write_lock.lock().unwrap();
+        self.refresh_from_disk_locked()?;
         if let Some(mgr) = &self.process_lock {
-            let guard = mgr
-                .pin_reader()
-                .unwrap_or_else(|e| panic!("yiTrace reader pin failed: {e}"));
-            self.current
-                .pin_snapshot_with_external_guard(Box::new(guard))
+            let guard = mgr.pin_reader()?;
+            Ok(self
+                .current
+                .pin_snapshot_with_external_guard(Box::new(guard)))
         } else {
-            self.current.pin_snapshot()
+            Ok(self.current.pin_snapshot())
         }
     }
 

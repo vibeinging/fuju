@@ -347,6 +347,10 @@ class YiTraceDB:
     def ingest(self, events: list[Mapping[str, Any]], *, tenant_id: TenantId | None = None) -> Any:
         return self.route_json("POST", "/v1/ingest", events, tenant_id=tenant_id)
 
+    def index_embedding(self, trace_id: int | str, span_id: int | str, embedding: list[float], *, tenant_id: TenantId | None = None) -> None:
+        self._ensure_open()
+        self._native.index_embedding(str(trace_id), str(span_id), embedding, _tenant_id(tenant_id) or self._tenant_id)
+
     def ingest_otlp(self, body: Mapping[str, Any] | str, *, tenant_id: TenantId | None = None) -> Any:
         return self.route_json("POST", "/v1/traces", body, tenant_id=tenant_id)
 

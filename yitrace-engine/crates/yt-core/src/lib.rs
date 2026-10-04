@@ -666,21 +666,24 @@ pub mod fold {
 
     /// 折叠。输出按 (trace_id, span_id) 升序，确定可复算（审计可复现的形式）。
     pub fn fold_events(events: impl IntoIterator<Item = FoldInput>) -> Vec<FoldedSpan> {
-        // 1. 按 event_id 去重（保留首次见到的；跨源重复/重传被吃掉）。
-        let mut seen: HashSet<EventId> = HashSet::new();
-        // 2. 按 (trace_id, span_id) 分组（BTreeMap 给确定输出序）。
-        let mut groups: BTreeMap<(u64, u64), Vec<FoldInput>> = BTreeMap::new();
+        // 事件算法不改；只把租户放到本地去重域，避免另一租户的相同上报被吃掉。
+        let mut seen: HashSet<(Option<u64>, EventId)> = HashSet::new();
+        // 2. 租户是 span 身份的一部分；先分组再折叠，绝不能把不同租户原文并起来。
+        let mut groups: BTreeMap<(Option<u64>, u64, u64), Vec<FoldInput>> = BTreeMap::new();
         for e in events {
             let eid = e.identity.event_id();
-            if !seen.insert(eid) {
+            if !seen.insert((e.fields.tenant_id, eid)) {
                 continue; // 已见过这个 event_id，丢弃（去重）
             }
-            groups.entry((e.trace_id, e.span_id)).or_default().push(e);
+            groups
+                .entry((e.fields.tenant_id, e.trace_id, e.span_id))
+                .or_default()
+                .push(e);
         }
 
         // 3. 组内按 seq 升序，last-non-null-wins + logs union。
         let mut out = Vec::with_capacity(groups.len());
-        for ((trace_id, span_id), mut evs) in groups {
+        for ((_tenant, trace_id, span_id), mut evs) in groups {
             evs.sort_by_key(|e| e.identity.seq);
             let event_count = evs.len();
             let mut has_start = false;
@@ -823,6 +826,7 @@ pub mod fold {
                 event_count,
             });
         }
+        out.sort_by_key(|span| (span.trace_id, span.span_id, span.tenant_id));
         out
     }
 

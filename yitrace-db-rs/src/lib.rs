@@ -71,7 +71,7 @@ impl YiTraceDb {
     pub fn open_with_options(options: OpenOptions) -> Result<Self> {
         std::fs::create_dir_all(&options.data_dir)?;
         let coord = WriteCoordinator::open_durable(&options.data_dir)?;
-        coord.recover();
+        coord.try_recover()?;
         let api = EngineJsonApi::new(Arc::clone(&coord));
         Ok(Self {
             coord,
@@ -119,6 +119,14 @@ impl YiTraceDb {
 
     pub fn ingest_otlp_json(&self, otlp_json: &str) -> Result<String> {
         self.route_json("POST", "/v1/traces", otlp_json)
+    }
+
+    /// 旁路向量沿用连接的租户身份；旧无租户连接仍使用 None。
+    pub fn index_embedding(&self, trace_id: u64, span_id: u64, embedding: Vec<f32>) -> Result<()> {
+        self.ensure_open()?;
+        self.coord
+            .index_embedding_for_tenant(self.tenant_id, trace_id, span_id, embedding)?;
+        Ok(())
     }
 
     pub fn search(&self, query: &SearchQuery) -> Result<String> {
@@ -267,7 +275,7 @@ impl YiTraceDb {
 
     pub fn flush(&self) -> Result<()> {
         self.ensure_open()?;
-        self.coord.flush_memtable();
+        self.coord.try_flush_memtable()?;
         Ok(())
     }
 
@@ -275,7 +283,7 @@ impl YiTraceDb {
         if self.closed {
             return Ok(());
         }
-        self.coord.flush_memtable();
+        self.coord.try_flush_memtable()?;
         self.closed = true;
         Ok(())
     }
@@ -292,7 +300,9 @@ impl YiTraceDb {
 impl Drop for YiTraceDb {
     fn drop(&mut self) {
         if !self.closed {
-            self.coord.flush_memtable();
+            if let Err(err) = self.coord.try_flush_memtable() {
+                eprintln!("yiTrace close flush failed: {err}");
+            }
             self.closed = true;
         }
     }

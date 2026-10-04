@@ -10,7 +10,7 @@ mod disk;
 use disk::DiskTraceRollup;
 
 pub(crate) struct TraceAggregateRollupIndex {
-    rows: HashMap<(u64, u64), TraceAggregateRollupRow>,
+    rows: HashMap<crate::ScopedSpanKey, TraceAggregateRollupRow>,
     by_trace: BTreeMap<u64, Vec<u64>>,
     disk: Option<DiskTraceRollup>,
     dirty: bool,
@@ -37,13 +37,11 @@ impl TraceAggregateRollupIndex {
         if self.dirty {
             return;
         }
-        let key = (record.trace_id, record.span_id);
+        let key = (record.fields.tenant_id, record.trace_id, record.span_id);
         if !self.rows.contains_key(&key) {
-            if let Some(existing) = self
-                .disk
-                .as_mut()
-                .and_then(|disk| disk.find_row(record.trace_id, record.span_id))
-            {
+            if let Some(existing) = self.disk.as_mut().and_then(|disk| {
+                disk.find_row(record.fields.tenant_id, record.trace_id, record.span_id)
+            }) {
                 self.rows.insert(key, existing);
             }
         }
@@ -67,14 +65,14 @@ impl TraceAggregateRollupIndex {
 
     pub(crate) fn from_records(
         records: impl IntoIterator<Item = WalRecord>,
-        patches: impl IntoIterator<Item = ((u64, u64), SpanFields)>,
+        patches: impl IntoIterator<Item = (crate::ScopedSpanKey, SpanFields)>,
     ) -> Self {
         let mut next = Self::default();
         for record in records {
             next.apply_record(&record);
         }
-        for ((trace_id, span_id), fields) in patches {
-            if let Some(row) = next.rows.get_mut(&(trace_id, span_id)) {
+        for (key, fields) in patches {
+            if let Some(row) = next.rows.get_mut(&key) {
                 row.apply_fields(&fields);
             }
         }
@@ -84,7 +82,7 @@ impl TraceAggregateRollupIndex {
     pub(crate) fn rebuild(
         &mut self,
         records: impl IntoIterator<Item = WalRecord>,
-        patches: impl IntoIterator<Item = ((u64, u64), SpanFields)>,
+        patches: impl IntoIterator<Item = (crate::ScopedSpanKey, SpanFields)>,
     ) {
         *self = Self::from_records(records, patches);
     }
@@ -108,7 +106,11 @@ impl TraceAggregateRollupIndex {
             })?,
             None => Vec::new(),
         };
-        rows.retain(|row| !self.rows.contains_key(&(row.trace_id, row.span_id)));
+        rows.retain(|row| {
+            !self
+                .rows
+                .contains_key(&(row.tenant_id, row.trace_id, row.span_id))
+        });
         rows.extend(self.rows.values().cloned());
         disk::write_atomic(path, manifest_version, memtable_watermark, &mut rows)
     }
@@ -118,12 +120,12 @@ impl TraceAggregateRollupIndex {
         manifest_version: u64,
         memtable_watermark: u64,
     ) -> Option<Self> {
+        let disk = DiskTraceRollup::open(path, manifest_version, memtable_watermark)?;
+        if !disk.has_event_order() {
+            return None;
+        }
         Some(Self {
-            disk: Some(DiskTraceRollup::open(
-                path,
-                manifest_version,
-                memtable_watermark,
-            )?),
+            disk: Some(disk),
             ..Self::default()
         })
     }
@@ -182,7 +184,11 @@ impl TraceAggregateRollupIndex {
             Some(disk) => disk.rows_for_trace_ids(&trace_ids, tenant)?,
             None => Vec::new(),
         };
-        rows.retain(|row| !self.rows.contains_key(&(row.trace_id, row.span_id)));
+        rows.retain(|row| {
+            !self
+                .rows
+                .contains_key(&(row.tenant_id, row.trace_id, row.span_id))
+        });
         rows.extend(
             self.rows
                 .values()
@@ -343,7 +349,11 @@ impl TraceAggregateRollupIndex {
             Some(disk) => disk.matching_rows(query, filter)?,
             None => Vec::new(),
         };
-        rows.retain(|row| !self.rows.contains_key(&(row.trace_id, row.span_id)));
+        rows.retain(|row| {
+            !self
+                .rows
+                .contains_key(&(row.tenant_id, row.trace_id, row.span_id))
+        });
         rows.extend(
             self.rows
                 .values()
@@ -356,6 +366,7 @@ impl TraceAggregateRollupIndex {
 
 #[derive(Clone, Debug)]
 struct TraceAggregateRollupRow {
+    event_order: crate::SpanEventOrder,
     trace_id: u64,
     span_id: u64,
     has_start: bool,
@@ -392,6 +403,7 @@ impl TraceAggregateRollupRow {
 
     fn new(trace_id: u64, span_id: u64) -> Self {
         Self {
+            event_order: crate::SpanEventOrder::default(),
             trace_id,
             span_id,
             has_start: false,
@@ -422,6 +434,9 @@ impl TraceAggregateRollupRow {
     }
 
     fn apply_record(&mut self, record: &WalRecord) {
+        if !self.event_order.accept(record.identity.event_id().0) {
+            return;
+        }
         self.min_ts = self.min_ts.min(record.ts);
         self.max_ts = self.max_ts.max(record.ts);
         self.event_count = self.event_count.saturating_add(1);
@@ -430,66 +445,76 @@ impl TraceAggregateRollupRow {
             EventType::SpanEnd => self.has_end = true,
             _ => {}
         }
-        self.apply_fields(&record.fields);
+        self.apply_fields_at(&record.fields, record.identity.seq);
     }
 
     fn apply_fields(&mut self, fields: &SpanFields) {
-        if fields.session_id.is_some() {
+        self.apply_fields_at(fields, u64::MAX);
+    }
+    fn apply_fields_at(&mut self, fields: &SpanFields, seq: u64) {
+        if fields.session_id.is_some() && self.event_order.field("session_id", seq) {
             self.session_id = fields.session_id;
         }
-        if fields.tenant_id.is_some() {
+        if fields.tenant_id.is_some() && self.event_order.field("tenant_id", seq) {
             self.tenant_id = fields.tenant_id;
         }
-        if fields.external_trace_id.is_some() {
+        if fields.external_trace_id.is_some() && self.event_order.field("external_trace_id", seq) {
             self.external_trace_id = fields.external_trace_id.clone();
         }
-        if fields.external_span_id.is_some() {
+        if fields.external_span_id.is_some() && self.event_order.field("external_span_id", seq) {
             self.external_span_id = fields.external_span_id.clone();
         }
-        if fields.external_parent_span_id.is_some() {
+        if fields.external_parent_span_id.is_some()
+            && self.event_order.field("external_parent_span_id", seq)
+        {
             self.external_parent_span_id = fields.external_parent_span_id.clone();
         }
-        if fields.external_session_id.is_some() {
+        if fields.external_session_id.is_some()
+            && self.event_order.field("external_session_id", seq)
+        {
             self.external_session_id = fields.external_session_id.clone();
         }
-        if fields.span_name.is_some() {
+        if fields.span_name.is_some() && self.event_order.field("span_name", seq) {
             self.span_name = fields.span_name.clone();
         }
-        if fields.display_name.is_some() {
+        if fields.display_name.is_some() && self.event_order.field("display_name", seq) {
             self.display_name = fields.display_name.clone();
         }
-        if fields.status.is_some() {
+        if fields.status.is_some() && self.event_order.field("status", seq) {
             self.status = fields.status;
         }
-        if fields.parent_span_id.is_some() {
+        if fields.parent_span_id.is_some() && self.event_order.field("parent_span_id", seq) {
             self.parent_span_id = fields.parent_span_id;
         }
-        if fields.duration_ns.is_some() {
+        if fields.duration_ns.is_some() && self.event_order.field("duration_ns", seq) {
             self.duration_ns = fields.duration_ns;
         }
-        if fields.input_tokens.is_some() {
+        if fields.input_tokens.is_some() && self.event_order.field("input_tokens", seq) {
             self.input_tokens = fields.input_tokens;
         }
-        if fields.output_tokens.is_some() {
+        if fields.output_tokens.is_some() && self.event_order.field("output_tokens", seq) {
             self.output_tokens = fields.output_tokens;
         }
-        if fields.cache_read_tokens.is_some() {
+        if fields.cache_read_tokens.is_some() && self.event_order.field("cache_read_tokens", seq) {
             self.cache_read_tokens = fields.cache_read_tokens;
         }
-        if fields.cache_write_tokens.is_some() {
+        if fields.cache_write_tokens.is_some() && self.event_order.field("cache_write_tokens", seq)
+        {
             self.cache_write_tokens = fields.cache_write_tokens;
         }
-        if fields.agent_name.is_some() {
+        if fields.agent_name.is_some() && self.event_order.field("agent_name", seq) {
             self.agent_name = fields.agent_name.clone();
         }
-        if fields.tool_name.is_some() {
+        if fields.tool_name.is_some() && self.event_order.field("tool_name", seq) {
             self.tool_name = fields.tool_name.clone();
         }
-        if fields.model.is_some() {
+        if fields.model.is_some() && self.event_order.field("model", seq) {
             self.model = fields.model.clone();
         }
         for (key, value) in &fields.attrs {
-            self.attrs.insert(key.clone(), value.clone());
+            if self.event_order.field(&format!("attrs:{key}"), seq) {
+                self.attrs.insert(key.clone(), value.clone());
+            }
         }
     }
 
@@ -631,6 +656,11 @@ impl TraceAggregateRollupRow {
             put_opt_u64(out, self.cache_read_tokens);
             put_opt_u64(out, self.cache_write_tokens);
         }
+        if version >= 6 {
+            let order = self.event_order.encode();
+            put_u64(out, order.len() as u64);
+            out.extend_from_slice(&order);
+        }
         if version >= 5 {
             out.push(u8::from(self.has_start));
             out.push(u8::from(self.has_end));
@@ -672,6 +702,12 @@ impl TraceAggregateRollupRow {
         } else {
             (None, None)
         };
+        let event_order = if version >= 6 {
+            let len = usize::try_from(cur.u64()?).ok()?;
+            crate::SpanEventOrder::decode(cur.take(len)?)?
+        } else {
+            crate::SpanEventOrder::default()
+        };
         let (has_start, has_end) = if version >= 5 {
             (cur.u8()? != 0, cur.u8()? != 0)
         } else {
@@ -680,6 +716,7 @@ impl TraceAggregateRollupRow {
             (true, duration_ns.is_some())
         };
         Some(Self {
+            event_order,
             trace_id,
             span_id,
             has_start,

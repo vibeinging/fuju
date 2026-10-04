@@ -36,6 +36,8 @@ impl Ord for OrdF32 {
 }
 
 struct Node {
+    tenant_id: Option<u64>,
+    active: bool,
     key: (u64, u64),
     vec: Vec<f32>,
     /// 邻居在 nodes 里的下标。
@@ -80,7 +82,12 @@ fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
 
 impl GraphState {
     /// 插入一点并和已有点里最近的 m 个互相连边（建图 O(n²)，验证够用）。
-    fn insert(&mut self, key: (u64, u64), vec: Vec<f32>) {
+    fn insert(&mut self, tenant_id: Option<u64>, key: (u64, u64), vec: Vec<f32>) {
+        for node in &mut self.nodes {
+            if node.tenant_id == tenant_id && node.key == key {
+                node.active = false;
+            }
+        }
         let new_idx = self.nodes.len();
         // 找已有点里最近的 m 个。
         let mut near: Vec<(OrdF32, usize)> = self
@@ -93,6 +100,8 @@ impl GraphState {
         near.truncate(self.m);
 
         self.nodes.push(Node {
+            tenant_id,
+            active: true,
             key,
             vec,
             adj: near.iter().map(|&(_, i)| i).collect(),
@@ -171,7 +180,7 @@ impl GraphState {
     ) -> impl Fn(usize) -> bool + 'a {
         move |idx: usize| {
             let (t, s) = self.nodes[idx].key;
-            filter(t, s)
+            self.nodes[idx].active && self.nodes[idx].tenant_id.is_none() && filter(t, s)
         }
     }
 }
@@ -216,7 +225,7 @@ impl GraphAnnIndex {
             .into_iter()
             .filter(|&i| {
                 let (t, s) = st.nodes[i].key;
-                filter(t, s)
+                st.nodes[i].active && st.nodes[i].tenant_id.is_none() && filter(t, s)
             })
             .map(|i| {
                 (
@@ -241,7 +250,7 @@ impl GraphAnnIndex {
         let mut scored: Vec<(OrdF32, (u64, u64))> = st
             .nodes
             .iter()
-            .filter(|n| filter(n.key.0, n.key.1))
+            .filter(|n| n.active && n.tenant_id.is_none() && filter(n.key.0, n.key.1))
             .map(|n| (OrdF32(l2_sq(query, &n.vec)), n.key))
             .collect();
         scored.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -251,11 +260,52 @@ impl GraphAnnIndex {
 }
 
 impl GraphIndex for GraphAnnIndex {
+    fn supports_tenant_scope(&self) -> bool {
+        true
+    }
     fn index_embedding(&self, trace_id: u64, span_id: u64, embedding: Vec<f32>) {
         self.state
             .lock()
             .unwrap()
-            .insert((trace_id, span_id), embedding);
+            .insert(None, (trace_id, span_id), embedding);
+    }
+
+    fn index_embedding_scoped(
+        &self,
+        tenant_id: Option<u64>,
+        trace_id: u64,
+        span_id: u64,
+        embedding: Vec<f32>,
+    ) -> std::io::Result<()> {
+        self.state
+            .lock()
+            .unwrap()
+            .insert(tenant_id, (trace_id, span_id), embedding);
+        Ok(())
+    }
+    fn search_scoped(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter: &dyn Fn(Option<u64>, u64, u64) -> bool,
+    ) -> Vec<(Option<u64>, u64, u64, f32)> {
+        let state = self.state.lock().unwrap();
+        let admit = |i: usize| {
+            let n = &state.nodes[i];
+            n.active && filter(n.tenant_id, n.key.0, n.key.1)
+        };
+        state
+            .beam(query, self.ef.max(k), &admit)
+            .into_iter()
+            .take(k)
+            .map(|i| {
+                let n = &state.nodes[i];
+                (n.tenant_id, n.key.0, n.key.1, l2_sq(query, &n.vec).sqrt())
+            })
+            .collect()
+    }
+    fn clear(&self) {
+        self.state.lock().unwrap().nodes.clear();
     }
 
     /// 引擎默认走 **in-graph** 过滤（好的那条）。

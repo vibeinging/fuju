@@ -179,6 +179,8 @@ Use cases:
 - Use `indexEmbeddings([{ traceId, spanId, text }])` to batch document embedding through the configured embedder.
 - Use `ingest(events, { indexEmbeddings: true })` only when the ingest path is allowed to wait for embedding calls. The default is off so trace ingestion is not blocked by model latency.
 
+Embedding writes use the connection's `tenantId`, or the `tenantId` in the method options, just like ingest and search. The vector identity includes tenant, trace and span; repeating the same vector is idempotent, and a new vector for the same identity replaces the old search result. Numeric tenant `0` is distinct from a connection without a tenant.
+
 Do not mix different embedding models or dimensions in the same data dir. The
 wrapper validates vector dimensions in the current process, and the disk graph
 also rejects wrong dimensions, but same-dimension different-model vectors are a

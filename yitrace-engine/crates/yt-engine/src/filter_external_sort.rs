@@ -102,8 +102,10 @@ impl PostingRunBuilder {
             write_string(&mut file, &self.entries[start].value)?;
             file.write_all(&((end - start) as u64).to_le_bytes())?;
             for entry in &self.entries[start..end] {
-                file.write_all(&entry.key.0.to_le_bytes())?;
+                file.write_all(&[u8::from(entry.key.0.is_some())])?;
+                file.write_all(&entry.key.0.unwrap_or(0).to_le_bytes())?;
                 file.write_all(&entry.key.1.to_le_bytes())?;
+                file.write_all(&entry.key.2.to_le_bytes())?;
             }
             start = end;
         }
@@ -149,15 +151,26 @@ impl RunReader {
             self.field = Some(Arc::from(field));
             self.value = Some(Arc::from(value));
         }
-        let mut ids = [0u8; 16];
+        let mut ids = [0u8; 25];
         self.file.read_exact(&mut ids)?;
         self.remaining -= 1;
-        let trace_id = u64::from_le_bytes(ids[0..8].try_into().unwrap());
-        let span_id = u64::from_le_bytes(ids[8..16].try_into().unwrap());
+        let tenant_id = u64::from_le_bytes(ids[1..9].try_into().unwrap());
+        let tenant = match ids[0] {
+            0 => None,
+            1 => Some(tenant_id),
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid tenant",
+                ))
+            }
+        };
+        let trace_id = u64::from_le_bytes(ids[9..17].try_into().unwrap());
+        let span_id = u64::from_le_bytes(ids[17..25].try_into().unwrap());
         Ok(Some(Entry {
             field: Arc::clone(self.field.as_ref().unwrap()),
             value: Arc::clone(self.value.as_ref().unwrap()),
-            key: (trace_id, span_id),
+            key: (tenant, trace_id, span_id),
         }))
     }
 }
@@ -331,11 +344,11 @@ mod tests {
         ));
         let mut builder = PostingRunBuilder::with_run_bytes(&path, 128);
         for (field, value, key) in [
-            ("tenant", "2", (3, 3)),
-            ("project", "a", (2, 2)),
-            ("project", "a", (1, 1)),
-            ("project", "a", (1, 1)),
-            ("tenant", "2", (1, 1)),
+            ("tenant", "2", (None, 3, 3)),
+            ("project", "a", (None, 2, 2)),
+            ("project", "a", (None, 1, 1)),
+            ("project", "a", (None, 1, 1)),
+            ("tenant", "2", (None, 1, 1)),
         ] {
             builder
                 .push(field.to_owned(), value.to_owned(), key)
@@ -344,8 +357,8 @@ mod tests {
         let groups: Vec<_> = builder.finish().unwrap().map(Result::unwrap).collect();
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].field, "project");
-        assert_eq!(groups[0].keys, vec![(1, 1), (2, 2)]);
+        assert_eq!(groups[0].keys, vec![(None, 1, 1), (None, 2, 2)]);
         assert_eq!(groups[1].field, "tenant");
-        assert_eq!(groups[1].keys, vec![(1, 1), (3, 3)]);
+        assert_eq!(groups[1].keys, vec![(None, 1, 1), (None, 3, 3)]);
     }
 }

@@ -474,7 +474,8 @@ pub(crate) fn bm25_norm(tf: f32, dl: f32, avgdl: f32) -> f32 {
 /// 分词器可注入：`new()` 用兜底 bigram，`with_tokenizer` 可换任意词级分词器（同一套倒排/评分）。
 pub struct Bm25TextIndex {
     state: Mutex<Bm25State>,
-    tokenizer: Box<dyn Tokenizer>,
+    tokenizer: Arc<dyn Tokenizer>,
+    tenant_indexes: Mutex<std::collections::BTreeMap<u64, Arc<Bm25TextIndex>>>,
     query_inflight: Mutex<HashSet<QueryCacheKey>>,
     query_ready: Condvar,
 }
@@ -509,7 +510,8 @@ impl Bm25TextIndex {
     pub fn with_tokenizer(tokenizer: Box<dyn Tokenizer>) -> Self {
         Self {
             state: Mutex::new(Bm25State::default()),
-            tokenizer,
+            tokenizer: Arc::from(tokenizer),
+            tenant_indexes: Mutex::new(std::collections::BTreeMap::new()),
             query_inflight: Mutex::new(HashSet::new()),
             query_ready: Condvar::new(),
         }
@@ -728,6 +730,92 @@ fn index_tokens(st: &mut Bm25State, trace_id: u64, span_id: u64, toks: Vec<Strin
 }
 
 impl Bm25Index for Bm25TextIndex {
+    fn supports_tenant_scope(&self) -> bool {
+        true
+    }
+    fn empty_like(&self) -> Option<Arc<dyn Bm25Index>> {
+        Some(Arc::new(self.new_partition()))
+    }
+    fn index_text_scoped(&self, tenant: Option<u64>, trace: u64, span: u64, text: &str) {
+        match tenant {
+            Some(id) => self.partition(id).index_text(trace, span, text),
+            None => self.index_text(trace, span, text),
+        }
+    }
+    fn index_event_scoped(&self, tenant: Option<u64>, eid: u64, t: u64, sp: u64, text: &str) {
+        match tenant {
+            Some(tenant) => self.partition(tenant).index_event(eid, t, sp, text),
+            None => self.index_event(eid, t, sp, text),
+        }
+    }
+    fn mark_event_scoped(&self, tenant: Option<u64>, eid: u64) {
+        match tenant {
+            Some(tenant) => self.partition(tenant).mark_event(eid),
+            None => self.mark_event(eid),
+        }
+    }
+    fn search_all_scoped(&self, query: &str, k: usize) -> Vec<(Option<u64>, u64, u64, f32)> {
+        let mut hits = self
+            .search_partition(query, k)
+            .into_iter()
+            .map(|(t, s, score)| (None, t, s, score))
+            .collect::<Vec<_>>();
+        let children = self
+            .tenant_indexes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(&tenant, child)| (tenant, child.clone()))
+            .collect::<Vec<_>>();
+        for (tenant, child) in children {
+            hits.extend(
+                child
+                    .search_partition(query, k)
+                    .into_iter()
+                    .map(|(t, s, score)| (Some(tenant), t, s, score)),
+            );
+        }
+        hits.sort_by(|a, b| {
+            b.3.total_cmp(&a.3)
+                .then((a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)))
+        });
+        hits.truncate(k);
+        hits
+    }
+    fn search_scoped(
+        &self,
+        query: &str,
+        k: usize,
+        filter: &dyn Fn(Option<u64>, u64, u64) -> bool,
+    ) -> Vec<(Option<u64>, u64, u64, f32)> {
+        let children = self
+            .tenant_indexes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(&id, index)| (id, index.clone()))
+            .collect::<Vec<_>>();
+        let mut hits = self
+            .search_filtered_partition(query, k, &|t, s| filter(None, t, s))
+            .into_iter()
+            .map(|(t, s, score)| (None, t, s, score))
+            .collect::<Vec<_>>();
+        for (tenant, index) in children {
+            hits.extend(
+                index
+                    .search_filtered_partition(query, k, &|t, s| filter(Some(tenant), t, s))
+                    .into_iter()
+                    .map(|(t, s, score)| (Some(tenant), t, s, score)),
+            );
+        }
+        hits.sort_by(|a, b| {
+            b.3.total_cmp(&a.3)
+                .then((a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)))
+        });
+        hits.truncate(k);
+        hits
+    }
+
     fn index_text(&self, trace_id: u64, span_id: u64, text: &str) {
         let toks = self.tokenizer.tokenize(text);
         if toks.is_empty() {
@@ -755,6 +843,125 @@ impl Bm25Index for Bm25TextIndex {
     /// 候选全量打分后**终排（分降序、(trace,span) 升序）取 top-k**，与暴力逐位一致（有测试钉死）。
     /// 单词查询走块跳过（块上界 = idf·norm(max_tf,min_dl) < θ → 整块跳）；多词查询走 term 级 WAND（剪掉只命中弱词的文档）。
     fn search(&self, query: &str, k: usize) -> Vec<(u64, u64, f32)> {
+        let mut hits = self.search_partition(query, k);
+        for child in self.partition_handles() {
+            hits.extend(child.search_partition(query, k));
+        }
+        Self::rank_legacy(hits, k)
+    }
+
+    fn search_filtered(
+        &self,
+        query: &str,
+        k: usize,
+        filter: &dyn Fn(u64, u64) -> bool,
+    ) -> Vec<(u64, u64, f32)> {
+        let mut hits = self.search_filtered_partition(query, k, filter);
+        for child in self.partition_handles() {
+            hits.extend(child.search_filtered_partition(query, k, filter));
+        }
+        Self::rank_legacy(hits, k)
+    }
+
+    fn clear(&self) {
+        self.tenant_indexes.lock().unwrap().clear();
+        let mut state = self.state.lock().unwrap();
+        let disk_epoch = state.disk_epoch.wrapping_add(1);
+        let query_epoch = state.query_epoch.wrapping_add(1);
+        *state = Bm25State {
+            disk_epoch,
+            query_epoch,
+            ..Bm25State::default()
+        };
+    }
+
+    fn load_cache(&self, path: &Path, version: u64, watermark: u64) -> bool {
+        let Ok(meta) = std::fs::metadata(path) else {
+            return false;
+        };
+        if meta.len() < 36 || meta.len() > 8_000_036 {
+            return false;
+        }
+        let Ok(bytes) = std::fs::read(path) else {
+            return false;
+        };
+        if bytes.len() < 36 || &bytes[..8] != b"YTBMTS02" {
+            return false;
+        }
+        let payload_len = bytes.len() - 4;
+        let expected = u32::from_le_bytes(bytes[payload_len..].try_into().unwrap());
+        if yt_wal::crc32(&bytes[..payload_len]) != expected {
+            return false;
+        }
+        let u64_at = |n: usize| u64::from_le_bytes(bytes[n..n + 8].try_into().unwrap());
+        let count = u64_at(24) as usize;
+        if u64_at(8) != version
+            || u64_at(16) != watermark
+            || count > 1_000_000
+            || bytes.len() != 36 + count * 8
+        {
+            return false;
+        }
+        if !self.load_plain_cache(&path.with_extension("none.dat"), version, watermark) {
+            return false;
+        }
+        let mut loaded = std::collections::BTreeMap::new();
+        for i in 0..count {
+            let tenant = u64_at(32 + i * 8);
+            if loaded.contains_key(&tenant) {
+                return false;
+            }
+            let child = self.new_partition();
+            if !child.load_plain_cache(&Self::tenant_cache_path(path, tenant), version, watermark) {
+                return false;
+            }
+            loaded.insert(tenant, Arc::new(child));
+        }
+        *self.tenant_indexes.lock().unwrap() = loaded;
+        self.share_partition_budgets();
+        true
+    }
+    fn save_cache(&self, path: &Path, version: u64, watermark: u64) -> std::io::Result<bool> {
+        self.save_plain_cache(&path.with_extension("none.dat"), version, watermark)?;
+        let children = self.tenant_indexes.lock().unwrap();
+        let mut bytes = b"YTBMTS02".to_vec();
+        bytes.extend_from_slice(&version.to_le_bytes());
+        bytes.extend_from_slice(&watermark.to_le_bytes());
+        bytes.extend_from_slice(&(children.len() as u64).to_le_bytes());
+        for (&tenant, child) in children.iter() {
+            child.save_plain_cache(&Self::tenant_cache_path(path, tenant), version, watermark)?;
+            bytes.extend_from_slice(&tenant.to_le_bytes());
+        }
+        let checksum = yt_wal::crc32(&bytes);
+        bytes.extend_from_slice(&checksum.to_le_bytes());
+        let temporary = path.with_extension("tenants.tmp");
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&temporary)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(temporary, path)?;
+        Ok(true)
+    }
+}
+
+impl Bm25TextIndex {
+    /// 旧裸查询聚合所有租户，但不合并相同pair的两条文档；带tenant接口保留完整身份。
+    fn partition_handles(&self) -> Vec<Arc<Self>> {
+        self.tenant_indexes
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect()
+    }
+    fn rank_legacy(mut hits: Vec<(u64, u64, f32)>, k: usize) -> Vec<(u64, u64, f32)> {
+        hits.sort_by(|a, b| b.2.total_cmp(&a.2).then((a.0, a.1).cmp(&(b.0, b.1))));
+        hits.truncate(k);
+        hits
+    }
+    fn search_partition(&self, query: &str, k: usize) -> Vec<(u64, u64, f32)> {
         if k == 0 {
             return Vec::new();
         }
@@ -785,7 +992,7 @@ impl Bm25Index for Bm25TextIndex {
             ready: &self.query_ready,
         };
 
-        let hits = self.search_filtered(query, k, &|_, _| true);
+        let hits = self.search_filtered_partition(query, k, &|_, _| true);
         {
             let mut state = self.state.lock().unwrap();
             if state.query_epoch == query_epoch {
@@ -794,8 +1001,7 @@ impl Bm25Index for Bm25TextIndex {
         }
         hits
     }
-
-    fn search_filtered(
+    fn search_filtered_partition(
         &self,
         query: &str,
         k: usize,
@@ -973,60 +1179,7 @@ impl Bm25Index for Bm25TextIndex {
         scored.truncate(k);
         scored
     }
-
-    fn clear(&self) {
-        let mut state = self.state.lock().unwrap();
-        let disk_epoch = state.disk_epoch.wrapping_add(1);
-        let query_epoch = state.query_epoch.wrapping_add(1);
-        *state = Bm25State {
-            disk_epoch,
-            query_epoch,
-            ..Bm25State::default()
-        };
-    }
-
-    fn load_cache(&self, path: &Path, manifest_version: u64, memtable_watermark: u64) -> bool {
-        let Some(disk) = DiskBm25Cache::open(path, manifest_version, memtable_watermark) else {
-            return false;
-        };
-        let total_len = disk.total_len();
-        let mut state = self.state.lock().unwrap();
-        let disk_epoch = state.disk_epoch.wrapping_add(1);
-        let query_epoch = state.query_epoch.wrapping_add(1);
-        *state = Bm25State {
-            total_len,
-            disk: Some(disk),
-            disk_epoch,
-            query_epoch,
-            ..Bm25State::default()
-        };
-        true
-    }
-
-    fn save_cache(
-        &self,
-        path: &Path,
-        manifest_version: u64,
-        memtable_watermark: u64,
-    ) -> std::io::Result<bool> {
-        self.state
-            .lock()
-            .unwrap()
-            .save_cache(path, manifest_version, memtable_watermark)?;
-        Ok(true)
-    }
-}
-
-impl Bm25TextIndex {
-    /// Eval 用完整评分：扫描查询词的全部 posting，不走 WAND、block 跳过、结果缓存或
-    /// singleflight。它是优化查询的慢速正确性基准，不应放进在线请求路径。
-    pub fn search_exact_for_eval(&self, query: &str, k: usize) -> Vec<(u64, u64, f32)> {
-        self.search_exact_filtered_for_eval(query, k, &|_, _| true)
-    }
-
-    /// 带过滤的 Eval 完整评分。内存只保留每个查询词的 posting 和 top-k，不为全部命中
-    /// 文档建立分数 HashMap，因此百万档高频词也可以运行。
-    pub fn search_exact_filtered_for_eval(
+    fn search_exact_partition_for_eval(
         &self,
         query: &str,
         k: usize,
@@ -1085,6 +1238,118 @@ impl Bm25TextIndex {
             .collect::<Vec<_>>();
         scored.sort_by(|a, b| b.2.total_cmp(&a.2).then((a.0, a.1).cmp(&(b.0, b.1))));
         scored
+    }
+    fn new_partition(&self) -> Self {
+        Self {
+            state: Mutex::new(Bm25State::default()),
+            tokenizer: self.tokenizer.clone(),
+            tenant_indexes: Mutex::new(std::collections::BTreeMap::new()),
+            query_inflight: Mutex::new(HashSet::new()),
+            query_ready: Condvar::new(),
+        }
+    }
+    fn partition(&self, tenant: u64) -> Arc<Self> {
+        let (partition, created) = {
+            let mut children = self.tenant_indexes.lock().unwrap();
+            if let Some(index) = children.get(&tenant) {
+                (index.clone(), false)
+            } else {
+                let index = Arc::new(self.new_partition());
+                children.insert(tenant, index.clone());
+                (index, true)
+            }
+        };
+        if created {
+            self.share_partition_budgets();
+        }
+        partition
+    }
+
+    /// 租户各自计算词频，但所有分区共享原有缓存预算，不能随租户数放大内存上限。
+    fn share_partition_budgets(&self) {
+        let children = self.tenant_indexes.lock().unwrap();
+        let count = children.len() + 1;
+        let postings_budget = std::env::var("YT_BM25_POSTINGS_CACHE_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(64 * 1024 * 1024)
+            / count;
+        let query_budget = std::env::var("YT_BM25_QUERY_CACHE_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(16 * 1024 * 1024)
+            / count;
+        for index in std::iter::once(self).chain(children.values().map(Arc::as_ref)) {
+            let mut state = index.state.lock().unwrap();
+            state.query_cache.budget = query_budget;
+            if state.query_cache.bytes > query_budget {
+                state.query_cache.clear();
+            }
+            if let Some(disk) = state.disk.as_mut() {
+                disk.set_cache_budget(postings_budget);
+            }
+        }
+    }
+    fn tenant_cache_path(path: &Path, tenant: u64) -> std::path::PathBuf {
+        path.with_extension(format!("tenant-{tenant}.dat"))
+    }
+    fn load_plain_cache(
+        &self,
+        path: &Path,
+        manifest_version: u64,
+        memtable_watermark: u64,
+    ) -> bool {
+        let Some(disk) = DiskBm25Cache::open(path, manifest_version, memtable_watermark) else {
+            return false;
+        };
+        let total_len = disk.total_len();
+        let mut state = self.state.lock().unwrap();
+        let disk_epoch = state.disk_epoch.wrapping_add(1);
+        let query_epoch = state.query_epoch.wrapping_add(1);
+        *state = Bm25State {
+            total_len,
+            disk: Some(disk),
+            disk_epoch,
+            query_epoch,
+            ..Bm25State::default()
+        };
+        true
+    }
+
+    fn save_plain_cache(
+        &self,
+        path: &Path,
+        manifest_version: u64,
+        memtable_watermark: u64,
+    ) -> std::io::Result<bool> {
+        self.state
+            .lock()
+            .unwrap()
+            .save_cache(path, manifest_version, memtable_watermark)?;
+        Ok(true)
+    }
+}
+
+impl Bm25TextIndex {
+    /// Eval 用完整评分：扫描查询词的全部 posting，不走 WAND、block 跳过、结果缓存或
+    /// singleflight。它是优化查询的慢速正确性基准，不应放进在线请求路径。
+    pub fn search_exact_for_eval(&self, query: &str, k: usize) -> Vec<(u64, u64, f32)> {
+        self.search_exact_filtered_for_eval(query, k, &|_, _| true)
+    }
+
+    /// 带过滤的 Eval 完整评分。内存只保留每个查询词的 posting 和 top-k，不为全部命中
+    /// 文档建立分数 HashMap，因此百万档高频词也可以运行。
+    pub fn search_exact_filtered_for_eval(
+        &self,
+        query: &str,
+        k: usize,
+        filter: &dyn Fn(u64, u64) -> bool,
+    ) -> Vec<(u64, u64, f32)> {
+        let mut hits = self.search_exact_partition_for_eval(query, k, filter);
+        for child in self.partition_handles() {
+            hits.extend(child.search_exact_partition_for_eval(query, k, filter));
+        }
+        Self::rank_legacy(hits, k)
     }
 }
 
@@ -1697,5 +1962,42 @@ mod tests {
 
         assert_eq!(hits, loaded.search_exact_for_eval("common phrase", 10));
         let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn legacy_queries_aggregate_tenants_and_keep_scoped_cache_invalidation() {
+        let bm = Bm25TextIndex::new();
+        bm.index_event_scoped(Some(1), 99, 1, 1, "alpha");
+        bm.index_event_scoped(Some(2), 99, 1, 1, "beta");
+        assert_eq!(bm.search("alpha beta", 10).len(), 2);
+        assert_eq!(
+            bm.search("alpha beta", 10),
+            bm.search_exact_for_eval("alpha beta", 10)
+        );
+        assert_eq!(bm.search_filtered("beta", 10, &|_, _| true).len(), 1);
+        assert_eq!(bm.search_all_scoped("fresh", 10).len(), 0);
+        bm.index_event_scoped(Some(2), 100, 2, 2, "fresh");
+        assert_eq!(bm.search_all_scoped("fresh", 10)[0].0, Some(2));
+        assert_eq!(bm.search("fresh", 10).len(), 1);
+        let dir = std::env::temp_dir().join(format!(
+            "yt_bm25_tenant_catalog_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bm25.dat");
+        bm.save_cache(&path, 1, 3).unwrap();
+        let loaded = Bm25TextIndex::new();
+        assert!(loaded.load_cache(&path, 1, 3));
+        assert_eq!(loaded.search("alpha beta", 10), bm.search("alpha beta", 10));
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[32] ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(
+            !Bm25TextIndex::new().load_cache(&path, 1, 3),
+            "损坏目录必须从原始事件重建"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

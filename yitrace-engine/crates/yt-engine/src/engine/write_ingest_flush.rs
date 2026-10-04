@@ -42,9 +42,10 @@ impl WriteCoordinator {
         }
         let event_id = r.identity.event_id().0;
         if parts.is_empty() {
-            self.bm25.mark_event(event_id);
+            self.bm25.mark_event_scoped(r.fields.tenant_id, event_id);
         } else {
-            self.bm25.index_event(
+            self.bm25.index_event_scoped(
+                r.fields.tenant_id,
                 event_id,
                 r.trace_id,
                 r.span_id,
@@ -59,65 +60,36 @@ impl WriteCoordinator {
             self.trace_rollup.lock().unwrap().apply_record(r);
         }
 
-        // 会话边车：用 last-non-null 算出该 span 的新聚合，差量更新会话级（增量、O(1)/事件）。
-        let key = (r.trace_id, r.span_id);
-        let mut idx = self.session_idx.lock().unwrap();
-        let mut new = idx.span.get(&key).cloned().unwrap_or_default();
-        new.trace = r.trace_id;
-        if let Some(s) = r.fields.session_id {
-            new.session = Some(s);
-        }
-        if let Some(s) = &r.fields.external_session_id {
-            new.external_session = Some(s.clone());
-        }
-        if let Some(t) = r.fields.input_tokens {
-            new.in_tok = t;
-        }
-        if let Some(t) = r.fields.output_tokens {
-            new.out_tok = t;
-        }
-        if let Some(t) = r.fields.cache_read_tokens {
-            new.cache_read = Some(t);
-        }
-        if let Some(t) = r.fields.cache_write_tokens {
-            new.cache_write = Some(t);
-        }
-        if r.fields.model.is_some()
-            || r.fields.input_tokens.is_some()
-            || r.fields.output_tokens.is_some()
-            || r.fields.cache_read_tokens.is_some()
-            || r.fields.cache_write_tokens.is_some()
-        {
-            new.is_llm = true;
-        }
-        if let Some(st) = r.fields.status {
-            new.error = st != 0;
-        }
-        match r.identity.event_type {
-            yt_core::event::EventType::SpanStart => new.has_start = true,
-            yt_core::event::EventType::SpanEnd => new.has_end = true,
-            _ => {}
-        }
-        if new.agent.is_none() {
-            if let Some(a) = &r.fields.agent_name {
-                new.agent = Some(a.clone());
-            }
-        }
-        idx.apply_span(key, new);
+        self.session_idx.lock().unwrap().apply_record(r);
     }
 
     /// 写入：先进 WAL（ack 后才算持久），同步进活 MemTable，再推进已提交尾。
     /// 折叠在读时做，所以写路径不需要「脏队列」（决策文档已去掉 fold_dirty）。
     /// 整个过 write_lock 串行（单写者）。
     pub fn ingest(&self, records: Vec<WalRecord>) -> WalLsn {
-        let _process = self.acquire_process_lock("write");
+        self.try_ingest(records).expect("yiTrace ingest failed")
+    }
+
+    pub fn try_ingest(&self, records: Vec<WalRecord>) -> std::io::Result<WalLsn> {
+        if records.iter().any(|r| r.fields.tenant_id.is_some())
+            && !self.bm25.supports_tenant_scope()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "BM25 adapter does not support tenant scope",
+            ));
+        }
+        let _process = self.try_acquire_process_lock("write")?;
         let _w = self.write_lock.lock().unwrap();
-        self.refresh_from_disk_locked();
+        self.refresh_from_disk_locked()?;
         // clean reopen 不预载派生索引；第一次写入前补齐，保证历史索引和新事件在同一状态上增量更新。
         self.ensure_all_read_models_current_locked();
         let mut wal = self.wal.lock().unwrap();
         // 这批的起始 LSN（在 append 之前确定），逐条分配 commit_lsn。
         let first = wal.committed_tail().get() + 1;
+        // WAL 写入与同步成功之后，才允许可见行进入 MemTable 和派生索引。
+        let last = wal.try_append_committed_records(&records)?;
+        drop(wal);
         {
             let mut mt = self.memtable.lock().unwrap();
             for (i, r) in records.iter().enumerate() {
@@ -132,14 +104,20 @@ impl WriteCoordinator {
                 });
             }
         }
-        let last = wal.append_committed(records);
-        drop(wal);
+
         // ack 之后才推进 committed_tail（读者据此取 live_lsn 上界）。
         self.current.advance_committed_tail(last);
 
         // 内存表超阈值就自动刷盘，兜住内存上界（OPEN-2）。仍在 write_lock 下。
         if self.memtable.lock().unwrap().len() >= self.flush_threshold.load(Ordering::Relaxed) {
-            self.flush_memtable_locked();
+            // 已同步 WAL 的批次已经持久。自动 flush 失败保留内存行，显式 flush 可返回错误。
+            if let Err(err) = self.flush_memtable_locked() {
+                olog::log(
+                    olog::Level::Warn,
+                    "automatic_flush_failed",
+                    &[("error", &err.to_string())],
+                );
+            }
         }
         // 会话边车已在 index_record 里逐事件增量维护，这里无需额外动作。
         let n = first;
@@ -150,17 +128,34 @@ impl WriteCoordinator {
             "ingest",
             &[("lsn", &n), ("count", &cnt), ("tail", &tail)],
         );
-        last
+        Ok(last)
     }
 
     /// 摄入 SDK 线格式记录：转成内部 WalRecord（引擎自算 event_id）后走正常 `ingest`。
     /// 这是「打点 → 引擎存」的数据契约入口；上面再套一层 HTTP/OTLP 网关即闭环（网关是纯管道）。
     pub fn ingest_wire(&self, records: Vec<WireRecord>) -> WalLsn {
-        let recs: Vec<WalRecord> = records
-            .into_iter()
-            .map(WireRecord::into_wal_record)
-            .collect();
-        self.ingest(recs)
+        self.try_ingest_wire(records)
+            .expect("yiTrace wire ingest failed")
+    }
+
+    pub fn try_ingest_wire(&self, records: Vec<WireRecord>) -> std::io::Result<WalLsn> {
+        self.try_ingest(
+            records
+                .into_iter()
+                .map(WireRecord::into_wal_record)
+                .collect(),
+        )
+    }
+
+    pub fn try_ingest_wire_for_tenant(
+        &self,
+        mut records: Vec<WireRecord>,
+        tenant: Option<u64>,
+    ) -> std::io::Result<WalLsn> {
+        for r in &mut records {
+            r.tenant_id = tenant;
+        }
+        self.try_ingest_wire(records)
     }
 
     /// HTTP 网关专用摄入：租户来自鉴权上下文（如 `X-Tenant-Id`），覆盖 wire body 里的 tenant_id。
@@ -206,12 +201,16 @@ impl WriteCoordinator {
 
     /// 主动把内存表当前内容封成一个段（周期刷盘 / 关机前）。
     pub fn flush_memtable(&self) {
-        let _process = self.acquire_process_lock("write");
+        self.try_flush_memtable().expect("yiTrace flush failed");
+    }
+
+    pub fn try_flush_memtable(&self) -> std::io::Result<()> {
+        let _process = self.try_acquire_process_lock("write")?;
         let _w = self.write_lock.lock().unwrap();
-        self.refresh_from_disk_locked();
+        self.refresh_from_disk_locked()?;
         let before = self.memtable.lock().unwrap().len();
         let v_before = self.current.version();
-        self.flush_memtable_locked();
+        self.flush_memtable_locked()?;
         // 显式 flush 是派生缓存的持久化点。自动 flush 只保证主数据落盘，避免每个小段都重写
         // 全量 BM25/attrs/rollup sidecar；崩溃时旧 cache 会因 manifest 版本不符而重建。
         self.persist_read_model_sidecars();
@@ -225,17 +224,23 @@ impl WriteCoordinator {
                 ("version", &self.current.version()),
             ],
         );
+        Ok(())
     }
 
     /// 把内存表内容封段（调用方须已持 write_lock）。watermark 推进到内存表最新 LSN。
-    fn flush_memtable_locked(&self) {
+    fn flush_memtable_locked(&self) -> std::io::Result<()> {
         let (records, max_lsn) = {
-            let mt = self.memtable.lock().unwrap();
-            if mt.is_empty() {
-                return;
+            let mut mt = self.memtable.lock().unwrap();
+            if mt.newest_lsn().unwrap_or(0) <= self.current.memtable_watermark() {
+                // 只有旧快照保留行时不重复封段；快照已释放的前缀仍须按 gate 回收。
+                mt.evict_up_to(WalLsn::new(self.current.min_retained_watermark()));
+                return Ok(());
             }
             let records: Vec<WalRecord> = mt
-                .iter()
+                .read_range(
+                    WalLsn::new(self.current.memtable_watermark()),
+                    WalLsn::new(self.current.committed_tail()),
+                )
                 .map(|r| WalRecord {
                     trace_id: r.trace_id,
                     span_id: r.span_id,
@@ -247,7 +252,7 @@ impl WriteCoordinator {
             (records, mt.newest_lsn().unwrap())
         };
         let seg = self.alloc_segment_id();
-        self.segments.flush_to_segment(seg, &records);
+        self.segments.try_flush_to_segment(seg, &records)?;
         // 段级 key bloom：从这批记录的 (trace,span) 建，供检索折叠定位跳过无关段。
         let bloom = KeyBloom::build(
             records.iter().map(|r| (r.trace_id, r.span_id)),
@@ -274,13 +279,8 @@ impl WriteCoordinator {
                 upgrade_seq: 0,
             },
         );
-        self.commit_and_persist(draft);
-        if let Err(err) = self
-            .wal
-            .lock()
-            .unwrap()
-            .checkpoint(WalLsn::new(max_lsn))
-        {
+        self.commit_and_persist(draft)?;
+        if let Err(err) = self.wal.lock().unwrap().checkpoint(WalLsn::new(max_lsn)) {
             olog::log(
                 olog::Level::Warn,
                 "wal_checkpoint_save_failed",
@@ -289,6 +289,7 @@ impl WriteCoordinator {
         }
         let gate = WalLsn::new(self.current.min_retained_watermark());
         self.memtable.lock().unwrap().evict_up_to(gate);
+        Ok(())
     }
 
     /// 读 MemTable 源：某快照可见的半开区间 `(retained_watermark, live_lsn]`（测试/折叠用）。

@@ -186,6 +186,7 @@ impl Ord for OrdF32 {
 /// 一个节点的内存视图（从盘上定长记录解出）。
 #[derive(Clone, Debug, PartialEq)]
 pub struct NodeRec {
+    pub tenant_id: Option<u64>,
     pub trace_id: u64,
     pub span_id: u64,
     pub deleted: bool,

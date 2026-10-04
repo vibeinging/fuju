@@ -5,6 +5,15 @@ impl WriteCoordinator {
         snap: &Snapshot,
         trace_ids: &HashSet<u64>,
     ) -> BTreeMap<u64, (i64, i64)> {
+        self.trace_time_bounds_for_tenant(snap, trace_ids, None)
+    }
+
+    pub fn trace_time_bounds_for_tenant(
+        &self,
+        snap: &Snapshot,
+        trace_ids: &HashSet<u64>,
+        tenant: Option<u64>,
+    ) -> BTreeMap<u64, (i64, i64)> {
         let mut out = BTreeMap::<u64, (i64, i64)>::new();
         if trace_ids.is_empty() {
             return out;
@@ -18,6 +27,7 @@ impl WriteCoordinator {
             {
                 if entry.deletion_vec.is_deleted(row as u32)
                     || !trace_ids.contains(&record.trace_id)
+                    || tenant.is_some_and(|t| record.fields.tenant_id != Some(t))
                 {
                     continue;
                 }
@@ -28,7 +38,9 @@ impl WriteCoordinator {
         }
         let mt = self.memtable.lock().unwrap();
         for r in mt.read_range(snap.retained_watermark, snap.live_lsn) {
-            if !trace_ids.contains(&r.trace_id) {
+            if !trace_ids.contains(&r.trace_id)
+                || tenant.is_some_and(|t| r.fields.tenant_id != Some(t))
+            {
                 continue;
             }
             let e = out.entry(r.trace_id).or_insert((r.ts, r.ts));
@@ -46,19 +58,44 @@ impl WriteCoordinator {
         snap: &Snapshot,
         trace_ids: &HashSet<u64>,
     ) -> RetentionDeleteResult {
+        self.delete_segment_rows_for_traces_for_tenant(snap, trace_ids, None)
+    }
+
+    pub fn delete_segment_rows_for_traces_for_tenant(
+        &self,
+        snap: &Snapshot,
+        trace_ids: &HashSet<u64>,
+        tenant: Option<u64>,
+    ) -> RetentionDeleteResult {
+        self.try_delete_segment_rows_for_traces_for_tenant(snap, trace_ids, tenant)
+            .expect("retention storage failure")
+    }
+    pub fn try_delete_segment_rows_for_traces_for_tenant(
+        &self,
+        _snap: &Snapshot,
+        trace_ids: &HashSet<u64>,
+        tenant: Option<u64>,
+    ) -> std::io::Result<RetentionDeleteResult> {
+        // 计划之后可能有新写入；锁内重新检查当前热行，避免删除半条 trace。
+        let _process = self.try_acquire_process_lock("write")?;
+        let _w = self.write_lock.lock().unwrap();
+        self.refresh_from_disk_locked()?;
+        let snap = self.current.pin_snapshot();
         let mut result = RetentionDeleteResult {
             requested_trace_count: trace_ids.len(),
             ..Default::default()
         };
         if trace_ids.is_empty() {
-            return result;
+            return Ok(result);
         }
 
         let mut live_traces = HashSet::new();
         {
             let mt = self.memtable.lock().unwrap();
             for row in mt.read_range(snap.retained_watermark, snap.live_lsn) {
-                if trace_ids.contains(&row.trace_id) {
+                if trace_ids.contains(&row.trace_id)
+                    && tenant.is_none_or(|t| row.fields.tenant_id == Some(t))
+                {
                     live_traces.insert(row.trace_id);
                 }
             }
@@ -71,7 +108,10 @@ impl WriteCoordinator {
         let mut rows_by_segment: BTreeMap<u64, Vec<(u32, u64)>> = BTreeMap::new();
         for entry in snap.manifest.segments.values() {
             for (row, fi) in self.segments.scan_fold_inputs(entry.segment_id) {
-                if entry.deletion_vec.is_deleted(row) || !deletable.contains(&fi.trace_id) {
+                if entry.deletion_vec.is_deleted(row)
+                    || !deletable.contains(&fi.trace_id)
+                    || tenant.is_some_and(|t| fi.fields.tenant_id != Some(t))
+                {
                     continue;
                 }
                 rows_by_segment
@@ -81,12 +121,9 @@ impl WriteCoordinator {
             }
         }
         if rows_by_segment.is_empty() {
-            return result;
+            return Ok(result);
         }
 
-        let _process = self.acquire_process_lock("write");
-        let _w = self.write_lock.lock().unwrap();
-        self.refresh_from_disk_locked();
         let mut draft = self.current.cow_next();
         let mut deleted_traces = HashSet::new();
         let mut deleted_rows = 0usize;
@@ -112,7 +149,7 @@ impl WriteCoordinator {
             entry.deletion_vec = Arc::new(new_dv);
             entry.deletion_seq += 1;
         }
-        self.commit_and_persist(draft);
+        self.commit_and_persist(draft)?;
         self.session_idx.lock().unwrap().dirty = true;
         self.rebuild_trace_rollup_current();
         self.rebuild_filter_attrs_current();
@@ -123,7 +160,7 @@ impl WriteCoordinator {
         result.deleted_trace_ids.sort_unstable();
         result.deleted_trace_count = result.deleted_trace_ids.len();
         result.deleted_segment_row_count = deleted_rows;
-        result
+        Ok(result)
     }
 
     /// 可选压实：挑出 deletion ratio 达标的段，把删除位物化进新段并尝试安全回收旧段。
@@ -134,7 +171,22 @@ impl WriteCoordinator {
         min_deleted_percent: u32,
         reclaim_after: bool,
     ) -> RetentionCompactResult {
-        let snap = self.pin_snapshot();
+        self.try_compact_deleted_segments(
+            max_segments,
+            min_deleted_rows,
+            min_deleted_percent,
+            reclaim_after,
+        )
+        .expect("retention compaction failed")
+    }
+    pub fn try_compact_deleted_segments(
+        &self,
+        max_segments: usize,
+        min_deleted_rows: u32,
+        min_deleted_percent: u32,
+        reclaim_after: bool,
+    ) -> std::io::Result<RetentionCompactResult> {
+        let snap = self.try_pin_snapshot()?;
         let before_live_segment_count = snap.manifest.segments.len();
         let before_dead_segment_count = self.dead_set.lock().unwrap().len();
         let mut selected = Vec::new();
@@ -166,11 +218,15 @@ impl WriteCoordinator {
 
         let selected_segment_ids = selected.iter().map(|s| s.get()).collect::<Vec<_>>();
         for seg in &selected {
-            self.commit_compaction(&[*seg]);
+            self.try_commit_compaction(&[*seg])?;
         }
-        let reclaimed_segment_count = if reclaim_after { self.reclaim() } else { 0 };
-        let after = self.pin_snapshot();
-        RetentionCompactResult {
+        let reclaimed_segment_count = if reclaim_after {
+            self.try_reclaim()?
+        } else {
+            0
+        };
+        let after = self.try_pin_snapshot()?;
+        Ok(RetentionCompactResult {
             before_live_segment_count,
             after_live_segment_count: after.manifest.segments.len(),
             before_dead_segment_count,
@@ -181,7 +237,7 @@ impl WriteCoordinator {
             dropped_deleted_row_count,
             rewritten_live_row_count,
             selected_segment_ids,
-        }
+        })
     }
 
     pub fn add_retention_audit(
@@ -189,9 +245,18 @@ impl WriteCoordinator {
         input: NewRetentionAuditRecord,
         tenant_id: Option<u64>,
     ) -> RetentionAuditRecord {
-        let _process = self.acquire_process_lock("write");
+        self.try_add_retention_audit(input, tenant_id)
+            .expect("retention metadata write failed")
+    }
+    pub fn try_add_retention_audit(
+        &self,
+        input: NewRetentionAuditRecord,
+        tenant_id: Option<u64>,
+    ) -> std::io::Result<RetentionAuditRecord> {
+        let _process = self.try_acquire_process_lock("write")?;
         let _guard = self.write_lock.lock().unwrap();
-        self.refresh_from_disk_locked();
+        self.refresh_from_disk_locked()?;
+        let before = self.capture_metadata_state();
         let audit_id = {
             let mut next = self.next_retention_audit_id.lock().unwrap();
             let id = *next;
@@ -231,8 +296,11 @@ impl WriteCoordinator {
         };
         self.retention_audits.lock().unwrap().push(audit.clone());
         self.metadata_index.lock().unwrap().add_audit(&audit);
-        self.persist_metadata();
-        audit
+        if let Err(err) = self.persist_metadata() {
+            self.restore_metadata_state(before);
+            return Err(err);
+        }
+        Ok(audit)
     }
 
     pub fn retention_audits(&self, filter: &RetentionAuditFilter) -> Vec<RetentionAuditRecord> {
@@ -255,9 +323,18 @@ impl WriteCoordinator {
         input: NewRetentionPolicy,
         tenant_id: Option<u64>,
     ) -> RetentionPolicy {
-        let _process = self.acquire_process_lock("write");
+        self.try_add_retention_policy(input, tenant_id)
+            .expect("retention metadata write failed")
+    }
+    pub fn try_add_retention_policy(
+        &self,
+        input: NewRetentionPolicy,
+        tenant_id: Option<u64>,
+    ) -> std::io::Result<RetentionPolicy> {
+        let _process = self.try_acquire_process_lock("write")?;
         let _guard = self.write_lock.lock().unwrap();
-        self.refresh_from_disk_locked();
+        self.refresh_from_disk_locked()?;
+        let before = self.capture_metadata_state();
         let policy_id = {
             let mut next = self.next_retention_policy_id.lock().unwrap();
             let id = *next;
@@ -281,8 +358,11 @@ impl WriteCoordinator {
         };
         self.retention_policies.lock().unwrap().push(policy.clone());
         self.metadata_index.lock().unwrap().add_policy(&policy);
-        self.persist_metadata();
-        policy
+        if let Err(err) = self.persist_metadata() {
+            self.restore_metadata_state(before);
+            return Err(err);
+        }
+        Ok(policy)
     }
 
     pub fn retention_policies(&self, filter: &RetentionPolicyFilter) -> Vec<RetentionPolicy> {
@@ -310,20 +390,35 @@ impl WriteCoordinator {
         tenant_id: Option<u64>,
         now_ns: u64,
     ) -> Option<RetentionPolicy> {
-        let _process = self.acquire_process_lock("write");
+        self.try_mark_retention_policy_ran(policy_id, tenant_id, now_ns)
+            .expect("retention metadata write failed")
+    }
+    pub fn try_mark_retention_policy_ran(
+        &self,
+        policy_id: u64,
+        tenant_id: Option<u64>,
+        now_ns: u64,
+    ) -> std::io::Result<Option<RetentionPolicy>> {
+        let _process = self.try_acquire_process_lock("write")?;
         let _guard = self.write_lock.lock().unwrap();
-        self.refresh_from_disk_locked();
+        self.refresh_from_disk_locked()?;
+        let before = self.capture_metadata_state();
         let updated = {
             let mut policies = self.retention_policies.lock().unwrap();
-            let policy = policies.iter_mut().find(|p| {
+            let Some(policy) = policies.iter_mut().find(|p| {
                 p.policy_id == policy_id && metadata_tenant_allowed(p.tenant_id, tenant_id)
-            })?;
+            }) else {
+                return Ok(None);
+            };
             policy.last_run_at_ns = Some(now_ns);
             policy.next_run_at_ns = Some(now_ns.saturating_add(policy.interval_ns));
             policy.updated_at_ns = metadata::now_ns();
             policy.clone()
         };
-        self.persist_metadata();
-        Some(updated)
+        if let Err(err) = self.persist_metadata() {
+            self.restore_metadata_state(before);
+            return Err(err);
+        }
+        Ok(Some(updated))
     }
 }

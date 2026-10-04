@@ -39,6 +39,8 @@ The crate is not published yet. A real release should publish this crate as
 
 ## Usage
 
+`db.index_embedding(trace_id, span_id, vector)` accepts numeric internal IDs and uses the connection tenant. Repeating a vector is idempotent; updating it replaces the old vector for the same tenant and span.
+
 ```rust
 use yitrace_db::{OpenOptions, SearchQuery, SpanEndOptions, SpanEventBuilder, YiTraceDb};
 

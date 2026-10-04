@@ -14,7 +14,7 @@ use crate::{SearchFilter, TraceQuery};
 use super::{CacheCursor, TraceAggregateRollupRow};
 
 const MAGIC: u32 = 0x5954_524f; // "YTRO"
-const VERSION: u32 = 5;
+const VERSION: u32 = 6;
 const MIN_READ_VERSION: u32 = 2;
 const HEADER_LEN: u64 = 64;
 const PAGE_ROWS: usize = 4096;
@@ -46,6 +46,9 @@ pub(super) struct DiskTraceRollup {
 }
 
 impl DiskTraceRollup {
+    pub(super) fn has_event_order(&self) -> bool {
+        self.version >= 6
+    }
     pub(super) fn open(
         path: &Path,
         manifest_version: u64,
@@ -220,19 +223,22 @@ impl DiskTraceRollup {
 
     pub(super) fn find_row(
         &mut self,
+        tenant: Option<u64>,
         trace_id: u64,
         span_id: u64,
     ) -> Option<TraceAggregateRollupRow> {
         for page_id in 0..self.pages.len() {
             let page = &self.pages[page_id];
-            if trace_id < page.first_trace_id || trace_id > page.last_trace_id {
+            if tenant != page.tenant_id
+                || trace_id < page.first_trace_id
+                || trace_id > page.last_trace_id
+            {
                 continue;
             }
             let rows = self.load_page(page_id)?;
-            if let Some(row) = rows
-                .iter()
-                .find(|row| row.trace_id == trace_id && row.span_id == span_id)
-            {
+            if let Some(row) = rows.iter().find(|row| {
+                row.tenant_id == tenant && row.trace_id == trace_id && row.span_id == span_id
+            }) {
                 return Some(row.clone());
             }
         }

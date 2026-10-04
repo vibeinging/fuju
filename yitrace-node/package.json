@@ -55,7 +55,7 @@
     "pack:check": "npm pack --dry-run",
     "pack:local": "node tools/pack-local.mjs",
     "pack:verify": "npm run pack:local && node tools/verify-local-pack.mjs",
-    "test": "node test/test.mjs && node test/test.cjs",
+    "test": "node test/test.mjs && node test/test.cjs && node test/vector-tenant-regression.mjs && node test/durability-error-regression.mjs",
     "prepublishOnly": "npm run build && npm test"
   },
   "napi": {

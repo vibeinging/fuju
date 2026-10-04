@@ -575,36 +575,41 @@ impl VortexSegmentStore {
 
 impl SegmentStore for VortexSegmentStore {
     fn flush_to_segment(&self, seg: SegmentId, records: &[WalRecord]) {
+        self.try_flush_to_segment(seg, records)
+            .expect("Vortex segment write failed");
+    }
+
+    fn try_flush_to_segment(&self, seg: SegmentId, records: &[WalRecord]) -> std::io::Result<()> {
+        use std::io::Write;
         if records.is_empty() {
-            return;
+            return Ok(());
         }
         let st = Self::build_struct(records);
         let path = self.seg_path(seg);
-        // 写到内存 buffer（VortexWrite 接受 BufferMut），再 std::fs 原子落盘。
-        let r: VortexResult<ByteBufferMut> = self.rt.block_on(async {
-            let mut buf = ByteBufferMut::empty();
-            self.session
-                .write_options()
-                .write(&mut buf, st.into_array().to_array_stream())
-                .await?;
-            Ok::<ByteBufferMut, VortexError>(buf)
-        });
-        match r {
-            Ok(buf) => {
-                let tmp = path.with_extension("tmp");
-                if std::fs::write(&tmp, buf.as_slice()).is_ok() {
-                    if std::fs::rename(&tmp, &path).is_ok() {
-                        let _ = self.write_key_index(
-                            seg,
-                            records,
-                            buf.len() as u64,
-                            yt_wal::crc32(buf.as_slice()),
-                        );
-                    }
-                }
-            }
-            Err(e) => eprintln!("[vortex-segstore] flush seg {} 失败: {e}", seg.get()),
-        }
+        let buf: ByteBufferMut = self
+            .rt
+            .block_on(async {
+                let mut buf = ByteBufferMut::empty();
+                self.session
+                    .write_options()
+                    .write(&mut buf, st.into_array().to_array_stream())
+                    .await?;
+                Ok::<ByteBufferMut, VortexError>(buf)
+            })
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
+        let tmp = path.with_extension("tmp");
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(buf.as_slice())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, &path)?;
+        // 点读目录是可重建的派生索引，写失败不影响已持久化的主数据段。
+        let _ = self.write_key_index(
+            seg,
+            records,
+            buf.len() as u64,
+            yt_wal::crc32(buf.as_slice()),
+        );
+        Ok(())
     }
 
     fn scan_records(&self, seg: SegmentId) -> Vec<WalRecord> {

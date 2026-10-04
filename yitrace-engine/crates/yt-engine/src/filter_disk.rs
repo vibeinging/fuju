@@ -9,13 +9,13 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub(crate) type SpanKey = (u64, u64);
+pub(crate) type SpanKey = crate::ScopedSpanKey;
 
 const MAGIC: u32 = 0x5954_4641; // "YTFA"
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 const HEADER_LEN: u64 = 8 + 9 * 8;
-const ROW_REF_LEN: u64 = 28;
-const POSTING_LEN: u64 = 16;
+const ROW_REF_LEN: u64 = 37;
+const POSTING_LEN: u64 = 25;
 const DEFAULT_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
@@ -106,7 +106,7 @@ impl DiskFilterCache {
         let mut rows = Vec::with_capacity(usize::try_from(row_count).ok()?);
         let mut previous = None;
         for _ in 0..row_count {
-            let key = (row_cur.u64()?, row_cur.u64()?);
+            let key = (row_cur.tenant()?, row_cur.u64()?, row_cur.u64()?);
             let offset = row_cur.u64()?;
             let len = row_cur.u32()?;
             let end = offset.checked_add(u64::from(len))?;
@@ -258,13 +258,16 @@ impl DiskFilterCache {
         let mut cur = Cursor::new(&bytes);
         let mut set = HashSet::with_capacity(entry.count as usize);
         for _ in 0..entry.count {
+            let Some(tenant) = cur.tenant() else {
+                return PostingLookup::Missing;
+            };
             let Some(trace_id) = cur.u64() else {
                 return PostingLookup::Missing;
             };
             let Some(span_id) = cur.u64() else {
                 return PostingLookup::Missing;
             };
-            set.insert((trace_id, span_id));
+            set.insert((tenant, trace_id, span_id));
         }
         let heap_bytes = posting_set_heap_bytes(&set);
         let set = Arc::new(set);
@@ -353,8 +356,9 @@ where
     }
     let row_directory_offset = file.stream_position()?;
     for row in &row_refs {
-        file.write_all(&row.key.0.to_le_bytes())?;
+        write_tenant(&mut file, row.key.0)?;
         file.write_all(&row.key.1.to_le_bytes())?;
+        file.write_all(&row.key.2.to_le_bytes())?;
         file.write_all(&row.offset.to_le_bytes())?;
         file.write_all(&row.len.to_le_bytes())?;
     }
@@ -365,8 +369,9 @@ where
         let posting = posting?;
         let offset = file.stream_position()?;
         for key in &posting.keys {
-            file.write_all(&key.0.to_le_bytes())?;
+            write_tenant(&mut file, key.0)?;
             file.write_all(&key.1.to_le_bytes())?;
+            file.write_all(&key.2.to_le_bytes())?;
         }
         posting_refs.push((
             posting.field,
@@ -428,6 +433,15 @@ struct Cursor<'a> {
 }
 
 impl<'a> Cursor<'a> {
+    fn tenant(&mut self) -> Option<Option<u64>> {
+        let tag = self.u8()?;
+        let id = self.u64()?;
+        match tag {
+            0 => Some(None),
+            1 => Some(Some(id)),
+            _ => None,
+        }
+    }
     fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, pos: 0 }
     }
@@ -479,19 +493,19 @@ mod tests {
             &path,
             1,
             2,
-            [((1, 1), vec![1]), ((2, 1), vec![2])],
+            [((None, 1, 1), vec![1]), ((None, 2, 1), vec![2])],
             [
                 Ok(PostingWrite {
                     field: "project_id".to_string(),
                     value: "a".to_string(),
                     disabled: false,
-                    keys: vec![(1, 1)],
+                    keys: vec![(None, 1, 1)],
                 }),
                 Ok(PostingWrite {
                     field: "project_id".to_string(),
                     value: "b".to_string(),
                     disabled: false,
-                    keys: vec![(2, 1)],
+                    keys: vec![(None, 2, 1)],
                 }),
             ],
         )
@@ -521,4 +535,9 @@ mod tests {
         assert!(cache.cached_bytes <= cache.cache_budget);
         let _ = std::fs::remove_file(path);
     }
+}
+
+fn write_tenant(stream: &mut impl std::io::Write, tenant: Option<u64>) -> std::io::Result<()> {
+    stream.write_all(&[u8::from(tenant.is_some())])?;
+    stream.write_all(&tenant.unwrap_or(0).to_le_bytes())
 }

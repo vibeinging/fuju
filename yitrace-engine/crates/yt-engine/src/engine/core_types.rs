@@ -156,6 +156,11 @@ pub trait SegmentStore: Send + Sync {
     /// 把一批已 ack 事件写成段 `seg`（building→sealed）。
     /// seg 由协调器分配（单写者、全局唯一、永不复用），不由存储自选。
     fn flush_to_segment(&self, seg: SegmentId, records: &[WalRecord]);
+    /// 新写入接缝允许普通 I/O 错误返回；已有纯内存适配器保持兼容。
+    fn try_flush_to_segment(&self, seg: SegmentId, records: &[WalRecord]) -> std::io::Result<()> {
+        self.flush_to_segment(seg, records);
+        Ok(())
+    }
     /// 扫一个段，返回 (段内行号, 折叠输入)。读路径据行号查 deletion_vec 跳过已删行。
     /// 真实实现是 Vortex 段扫描 + 谓词/zone 剪枝下推；这里是接口边界。
     fn scan_fold_inputs(&self, seg: SegmentId) -> Vec<(u32, FoldInput)>;
@@ -265,6 +270,47 @@ impl BufferPins {
 /// BM25 中文倒排。真实实现 = 团队自有 BM25（cppjieba 分词 FFI + Rust 重写的倒排 + block-max-WAND）。
 /// 这是「FFI 复用评分/分词、重写存储」的落点（决策文档 §2.1）。接口按 span 维度（检索返回的是 trace/span）。
 pub trait Bm25Index: Send + Sync {
+    /// 派生索引必须明确支持租户分区；旧 adapter 只允许无租户写入。
+    fn supports_tenant_scope(&self) -> bool {
+        false
+    }
+    fn empty_like(&self) -> Option<Arc<dyn Bm25Index>> {
+        None
+    }
+    fn index_text_scoped(&self, _tenant: Option<u64>, trace: u64, span: u64, text: &str) {
+        self.index_text(trace, span, text)
+    }
+    fn index_event_scoped(
+        &self,
+        tenant: Option<u64>,
+        event_id: u64,
+        trace_id: u64,
+        span_id: u64,
+        text: &str,
+    ) {
+        // 写入口在拿写锁前检查 supports_tenant_scope；此默认路径只供旧无租户适配器。
+        let _ = tenant;
+        self.index_event(event_id, trace_id, span_id, text);
+    }
+    fn mark_event_scoped(&self, _tenant: Option<u64>, event_id: u64) {
+        self.mark_event(event_id);
+    }
+    /// 无过滤查询允许原生实现复用每租户缓存，评分仍保持分区独立。
+    fn search_all_scoped(&self, query: &str, k: usize) -> Vec<(Option<u64>, u64, u64, f32)> {
+        self.search_scoped(query, k, &|_, _, _| true)
+    }
+    fn search_scoped(
+        &self,
+        query: &str,
+        k: usize,
+        filter: &dyn Fn(Option<u64>, u64, u64) -> bool,
+    ) -> Vec<(Option<u64>, u64, u64, f32)> {
+        self.search_filtered(query, k, &|t, s| filter(None, t, s))
+            .into_iter()
+            .map(|(t, s, score)| (None, t, s, score))
+            .collect()
+    }
+
     /// 把某 span 的文本喂进倒排（ingest/flush 时调用）。真实实现走 jieba 分词 + 段内倒排。
     fn index_text(&self, trace_id: u64, span_id: u64, text: &str);
     /// 按确定性 event_id 幂等建索引。默认适配器仍按普通文本处理；原生持久索引会记住
@@ -329,7 +375,12 @@ pub trait Bm25Index: Send + Sync {
 
 /// graph_index 向量 ANN。真实实现 = 团队自有图索引（algorithm/distance/PQ 经 C ABI FFI 复用）。
 /// 「带过滤 ANN」目前是半成品（PoC C 要验进图过滤能否把召回拉回来），这里把 filter 作为一等参数。
+pub type ScopedSpanKey = (Option<u64>, u64, u64);
+
 pub trait GraphIndex: Send + Sync {
+    fn supports_tenant_scope(&self) -> bool {
+        false
+    }
     /// 给某 span 建/更新向量（向量由外部 embedder 算，不是每个 span 都有）。
     fn index_embedding(&self, trace_id: u64, span_id: u64, embedding: Vec<f32>);
     /// 带过滤的近邻搜索：`filter` 是下推进图搜索的谓词（service/time/status…）。
@@ -340,13 +391,68 @@ pub trait GraphIndex: Send + Sync {
         k: usize,
         filter: &dyn Fn(u64, u64) -> bool,
     ) -> Vec<(u64, u64, f32)>;
+    /// 租户属于向量身份。旧适配器只能处理无租户数据，不能把有租户向量写成全局数据。
+    fn index_embedding_scoped(
+        &self,
+        tenant_id: Option<u64>,
+        trace_id: u64,
+        span_id: u64,
+        embedding: Vec<f32>,
+    ) -> std::io::Result<()> {
+        if tenant_id.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "graph adapter does not support tenant-scoped embeddings",
+            ));
+        }
+        self.index_embedding(trace_id, span_id, embedding);
+        Ok(())
+    }
+    fn search_scoped(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter: &dyn Fn(Option<u64>, u64, u64) -> bool,
+    ) -> Vec<(Option<u64>, u64, u64, f32)> {
+        self.search(query, k, &|t, s| filter(None, t, s))
+            .into_iter()
+            .map(|(t, s, d)| (None, t, s, d))
+            .collect()
+    }
+    /// 只有旧格式缺租户记录的节点才需要源数据解析；现代明确None节点不参与。
+    fn needs_legacy_tenant_migration(&self) -> bool {
+        false
+    }
+    fn legacy_embedding_keys(&self) -> std::io::Result<Vec<(u64, u64)>> {
+        Ok(Vec::new())
+    }
+    fn migrate_legacy_embeddings(
+        &self,
+        _tenants: &HashMap<(u64, u64), Option<u64>>,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+    /// 独立向量写入不推进 WAL/manifest，因此必须另检查向量文件变化；只按需重开。
+    fn reload_if_changed(&self) {}
+    fn reload_if_changed_checked(&self) -> std::io::Result<()> {
+        self.reload_if_changed();
+        Ok(())
+    }
     /// 落盘点（提交时调）：插入只写不刷的实现（如磁盘索引）在此批量 fsync。内存实现默认空操作。
     /// 我们的场景 **append 极多、删除少** —— 插入走"只写不刷"，靠这里在提交点批量持久，吞吐才扛得住。
     fn flush(&self) {}
+    fn flush_checked(&self) -> std::io::Result<()> {
+        self.flush();
+        Ok(())
+    }
     /// 清空内存图。多进程 embedded 刷新时会从持久向量文件或磁盘图索引重建。
     fn clear(&self) {}
     /// 多进程 embedded 刷新时调用。持久图索引可重新打开元页/图文件，内存实现默认空操作。
     fn reload(&self) {}
+    fn reload_checked(&self) -> std::io::Result<()> {
+        self.reload();
+        Ok(())
+    }
 }
 
 /// 朴素内存 BM25 骨架：按 span 存文本，检索按「查询子串命中数」打分。
@@ -390,14 +496,14 @@ impl Bm25Index for InMemoryBm25 {
             .iter()
             .filter(|&(&(trace_id, span_id), _)| filter(trace_id, span_id))
             .filter_map(|(&(trace_id, span_id), text)| {
-                let score = qtokens.iter().filter(|token| text.contains(**token)).count() as f32;
+                let score = qtokens
+                    .iter()
+                    .filter(|token| text.contains(**token))
+                    .count() as f32;
                 (score > 0.0).then_some((trace_id, span_id, score))
             })
             .collect();
-        scored.sort_by(|a, b| {
-            b.2.total_cmp(&a.2)
-                .then((a.0, a.1).cmp(&(b.0, b.1)))
-        });
+        scored.sort_by(|a, b| b.2.total_cmp(&a.2).then((a.0, a.1).cmp(&(b.0, b.1))));
         scored.truncate(k);
         scored
     }
@@ -410,14 +516,28 @@ impl Bm25Index for InMemoryBm25 {
 /// 朴素内存向量索引骨架：暴力 L2 距离。真实实现换团队 graph_index（图式 ANN + 带过滤导航）。
 #[derive(Default)]
 pub struct InMemoryGraphIndex {
-    vecs: Mutex<BTreeMap<(u64, u64), Vec<f32>>>,
+    vecs: Mutex<BTreeMap<ScopedSpanKey, Vec<f32>>>,
 }
 impl GraphIndex for InMemoryGraphIndex {
+    fn supports_tenant_scope(&self) -> bool {
+        true
+    }
     fn index_embedding(&self, trace_id: u64, span_id: u64, embedding: Vec<f32>) {
+        self.index_embedding_scoped(None, trace_id, span_id, embedding)
+            .unwrap();
+    }
+    fn index_embedding_scoped(
+        &self,
+        tenant_id: Option<u64>,
+        trace_id: u64,
+        span_id: u64,
+        embedding: Vec<f32>,
+    ) -> std::io::Result<()> {
         self.vecs
             .lock()
             .unwrap()
-            .insert((trace_id, span_id), embedding);
+            .insert((tenant_id, trace_id, span_id), embedding);
+        Ok(())
     }
     fn search(
         &self,
@@ -425,17 +545,30 @@ impl GraphIndex for InMemoryGraphIndex {
         k: usize,
         filter: &dyn Fn(u64, u64) -> bool,
     ) -> Vec<(u64, u64, f32)> {
-        let g = self.vecs.lock().unwrap();
-        let mut scored: Vec<(u64, u64, f32)> = g
+        self.search_scoped(query, k, &|tenant, t, s| tenant.is_none() && filter(t, s))
+            .into_iter()
+            .map(|(_, t, s, d)| (t, s, d))
+            .collect()
+    }
+    fn search_scoped(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter: &dyn Fn(Option<u64>, u64, u64) -> bool,
+    ) -> Vec<(Option<u64>, u64, u64, f32)> {
+        let vectors = self.vecs.lock().unwrap();
+        let mut scored: Vec<_> = vectors
             .iter()
-            .filter(|(&(t, s), _)| filter(t, s))
-            .map(|(&(t, s), v)| (t, s, l2_distance(query, v)))
+            .filter(|(&(tenant, t, s), _)| filter(tenant, t, s))
+            .map(|(&(tenant, t, s), v)| (tenant, t, s, l2_distance(query, v)))
             .collect();
-        scored.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
+        scored.sort_by(|a, b| {
+            a.3.total_cmp(&b.3)
+                .then((a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)))
+        });
         scored.truncate(k);
         scored
     }
-
     fn clear(&self) {
         self.vecs.lock().unwrap().clear();
     }

@@ -61,6 +61,60 @@ pub fn load(path: impl AsRef<Path>) -> Vec<((u64, u64), Vec<f32>)> {
     out
 }
 
+/// 租户向量使用独立版本文件，保留旧 vectors.dat 的逐字节读取兼容。
+pub fn append_scoped(
+    path: impl AsRef<Path>,
+    tenant: Option<u64>,
+    trace: u64,
+    span: u64,
+    vector: &[f32],
+) -> std::io::Result<()> {
+    let mut bytes = Vec::new();
+    bytes.push(tenant.is_some() as u8);
+    bytes.extend_from_slice(&tenant.unwrap_or(0).to_le_bytes());
+    bytes.extend_from_slice(&trace.to_le_bytes());
+    bytes.extend_from_slice(&span.to_le_bytes());
+    bytes.extend_from_slice(&(vector.len() as u32).to_le_bytes());
+    for value in vector {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    let crc = yt_wal::crc32(&bytes);
+    bytes.extend_from_slice(&crc.to_le_bytes());
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(&bytes)?;
+    file.sync_data()
+}
+pub fn load_scoped(path: impl AsRef<Path>) -> Vec<(crate::ScopedSpanKey, Vec<f32>)> {
+    let bytes = std::fs::read(path).unwrap_or_default();
+    let mut result = Vec::new();
+    let mut offset = 0;
+    while offset + 33 <= bytes.len() {
+        let header = &bytes[offset..];
+        let dim = u32::from_le_bytes(header[25..29].try_into().unwrap()) as usize;
+        let Some(size) = dim.checked_mul(4).and_then(|n| n.checked_add(33)) else {
+            break;
+        };
+        if offset + size > bytes.len() {
+            break;
+        }
+        let frame = &bytes[offset..offset + size];
+        let crc = u32::from_le_bytes(frame[size - 4..].try_into().unwrap());
+        if crc != yt_wal::crc32(&frame[..size - 4]) || frame[0] > 1 {
+            break;
+        }
+        let tenant = (frame[0] == 1).then(|| u64::from_le_bytes(frame[1..9].try_into().unwrap()));
+        let trace = u64::from_le_bytes(frame[9..17].try_into().unwrap());
+        let span = u64::from_le_bytes(frame[17..25].try_into().unwrap());
+        let vector = frame[29..size - 4]
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        result.push(((tenant, trace, span), vector));
+        offset += size;
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,6 +140,27 @@ mod tests {
         assert_eq!(v[0], ((1, 10), vec![0.0, 1.5, -2.0]));
         assert_eq!(v[1], ((2, 20), vec![3.0]));
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn scoped_roundtrip_preserves_nullable_tenant_and_torn_tail() {
+        let path = temp();
+        append_scoped(&path, None, 1, 2, &[1.]).unwrap();
+        append_scoped(&path, Some(0), 1, 2, &[2.]).unwrap();
+        append_scoped(&path, Some(u64::MAX), 1, 2, &[3.]).unwrap();
+        assert_eq!(
+            load_scoped(&path),
+            vec![
+                ((None, 1, 2), vec![1.]),
+                ((Some(0), 1, 2), vec![2.]),
+                ((Some(u64::MAX), 1, 2), vec![3.])
+            ]
+        );
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.truncate(bytes.len() - 1);
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(load_scoped(&path).len(), 2);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

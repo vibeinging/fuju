@@ -8,7 +8,7 @@ use crate::{is_filter_attr_key, FilterAttrs, SearchFilter};
 use yt_core::fold::SpanFields;
 use yt_wal::WalRecord;
 
-type SpanKey = (u64, u64);
+type SpanKey = crate::ScopedSpanKey;
 
 const DEFAULT_POSTING_ENTRY_BUDGET: usize = 2_000_000;
 const DEFAULT_POSTING_SET_BUDGET: usize = 200_000;
@@ -101,7 +101,7 @@ impl FilterAttrsIndex {
 
     pub(crate) fn apply_record(&mut self, record: &WalRecord) {
         self.materialize_disk();
-        let key = (record.trace_id, record.span_id);
+        let key = (record.fields.tenant_id, record.trace_id, record.span_id);
         if let Some(old) = self.rows.get(&key).cloned() {
             self.remove_postings(key, &old);
         }
@@ -205,7 +205,7 @@ impl FilterAttrsIndex {
         };
         out.retain(|key| {
             if let Some(trace_id) = filter.trace_id {
-                if key.0 != trace_id {
+                if key.1 != trace_id {
                     return false;
                 }
             }
@@ -220,7 +220,7 @@ impl FilterAttrsIndex {
     /// BM25 已经给出少量候选时，逐条做最终过滤比复制一个低选择性的百万 key postings 更省。
     /// 磁盘态只读取这一条 attrs row；内存态直接查 HashMap，语义与候选集合路径一致。
     pub(crate) fn span_matches(&mut self, key: SpanKey, filter: &SearchFilter) -> bool {
-        if filter.trace_id.is_some_and(|trace_id| trace_id != key.0) {
+        if filter.trace_id.is_some_and(|trace_id| trace_id != key.1) {
             return false;
         }
         if let Some(disk) = self.disk.as_mut() {
@@ -312,7 +312,7 @@ impl FilterAttrsIndex {
 
     pub(crate) fn matches_key(&self, trace_id: u64, span_id: u64, filter: &SearchFilter) -> bool {
         self.rows
-            .get(&(trace_id, span_id))
+            .get(&(filter.tenant_id, trace_id, span_id))
             .map(|attrs| filter.attrs_match(attrs))
             .unwrap_or(false)
     }
@@ -467,7 +467,7 @@ impl FilterAttrsIndex {
         };
 
         if let Some(trace_id) = filter.trace_id {
-            out.retain(|key| key.0 == trace_id);
+            out.retain(|key| key.1 == trace_id);
         }
         if needs_row_check {
             out.retain(|&key| {
@@ -554,7 +554,7 @@ fn requested_postings(filter: &SearchFilter) -> Vec<PostingKey> {
 }
 
 fn posting_keys_for_row(key: SpanKey, row: &FilterAttrs) -> Vec<PostingKey> {
-    let mut out = vec![PostingKey::new("trace_id", key.0.to_string())];
+    let mut out = vec![PostingKey::new("trace_id", key.1.to_string())];
     if let Some(value) = &row.external_trace_id {
         out.push(PostingKey::new("external_trace_id", value));
     }
@@ -583,38 +583,47 @@ fn posting_keys_for_row(key: SpanKey, row: &FilterAttrs) -> Vec<PostingKey> {
 
 impl FilterAttrs {
     fn apply_record(&mut self, record: &WalRecord) {
+        if !self.event_order.accept(record.identity.event_id().0) {
+            return;
+        }
         self.min_ts = self.min_ts.min(record.ts);
         self.max_ts = self.max_ts.max(record.ts);
-        self.apply_fields(&record.fields);
+        self.apply_fields_at(&record.fields, record.identity.seq);
     }
 
     fn apply_fields(&mut self, fields: &SpanFields) {
-        if fields.external_trace_id.is_some() {
+        self.apply_fields_at(fields, u64::MAX);
+    }
+    fn apply_fields_at(&mut self, fields: &SpanFields, seq: u64) {
+        if fields.external_trace_id.is_some() && self.event_order.field("external_trace_id", seq) {
             self.external_trace_id = fields.external_trace_id.clone();
         }
-        if fields.status.is_some() {
+        if fields.status.is_some() && self.event_order.field("status", seq) {
             self.status = fields.status;
         }
-        if fields.agent_name.is_some() {
+        if fields.agent_name.is_some() && self.event_order.field("agent_name", seq) {
             self.agent_name = fields.agent_name.clone();
         }
-        if fields.tool_name.is_some() {
+        if fields.tool_name.is_some() && self.event_order.field("tool_name", seq) {
             self.tool_name = fields.tool_name.clone();
         }
-        if fields.model.is_some() {
+        if fields.model.is_some() && self.event_order.field("model", seq) {
             self.model = fields.model.clone();
         }
-        if fields.tenant_id.is_some() {
+        if fields.tenant_id.is_some() && self.event_order.field("tenant_id", seq) {
             self.tenant_id = fields.tenant_id;
         }
         for (key, value) in &fields.attrs {
-            if is_filter_attr_key(key) {
+            if is_filter_attr_key(key) && self.event_order.field(&format!("attrs:{key}"), seq) {
                 self.attrs.insert(key.clone(), value.clone());
             }
         }
     }
 
     fn encode(&self, out: &mut Vec<u8>) {
+        let order = self.event_order.encode();
+        put_u64(out, order.len() as u64);
+        out.extend_from_slice(&order);
         put_opt_string(out, self.external_trace_id.as_deref());
         put_opt_u8(out, self.status);
         put_opt_string(out, self.agent_name.as_deref());
@@ -631,6 +640,8 @@ impl FilterAttrs {
     }
 
     fn decode(cur: &mut CacheCursor<'_>) -> Option<Self> {
+        let len = usize::try_from(cur.u64()?).ok()?;
+        let event_order = crate::SpanEventOrder::decode(cur.take(len)?)?;
         let external_trace_id = cur.opt_string()?;
         let status = cur.opt_u8()?;
         let agent_name = cur.opt_string()?;
@@ -645,6 +656,7 @@ impl FilterAttrs {
             attrs.insert(cur.string()?, cur.string()?);
         }
         Some(Self {
+            event_order,
             external_trace_id,
             status,
             agent_name,
@@ -809,11 +821,14 @@ mod tests {
         assert_eq!(index.disabled_posting_count(), 1);
 
         let keys = index.candidate_span_keys(&attr_filter(&[("project_id", "wide")]));
-        assert_eq!(keys, HashSet::from([(1, 1), (2, 1), (3, 1)]));
+        assert_eq!(
+            keys,
+            HashSet::from([(None, 1, 1), (None, 2, 1), (None, 3, 1)])
+        );
 
         let keys =
             index.candidate_span_keys(&attr_filter(&[("project_id", "wide"), ("skill", "b")]));
-        assert_eq!(keys, HashSet::from([(2, 1)]));
+        assert_eq!(keys, HashSet::from([(None, 2, 1)]));
     }
 
     #[test]
@@ -826,7 +841,7 @@ mod tests {
         assert!(index.disabled_posting_count() >= 1);
 
         let keys = index.candidate_span_keys(&attr_filter(&[("project_id", "budgeted")]));
-        assert_eq!(keys, HashSet::from([(10, 7)]));
+        assert_eq!(keys, HashSet::from([(None, 10, 7)]));
     }
 
     #[test]
@@ -843,7 +858,7 @@ mod tests {
             external_trace_id: Some("run-a".to_string()),
             ..Default::default()
         });
-        assert_eq!(hit, HashSet::from([(11, 1)]));
+        assert_eq!(hit, HashSet::from([(None, 11, 1)]));
 
         let miss = index.candidate_span_keys(&SearchFilter {
             external_trace_id: Some("run-missing".to_string()),
@@ -862,7 +877,7 @@ mod tests {
             trace_id: Some(11),
             ..Default::default()
         });
-        assert_eq!(keys, HashSet::from([(11, 1)]));
+        assert_eq!(keys, HashSet::from([(None, 11, 1)]));
         assert_eq!(
             index.candidate_materialization_key_hint(&SearchFilter {
                 trace_id: Some(11),
@@ -941,18 +956,18 @@ mod tests {
                 ("project_id", "alpha"),
                 ("skill", "review")
             ])),
-            HashSet::from([(1, 10)])
+            HashSet::from([(Some(7), 1, 10)])
         );
         assert!(
             loaded.rows.is_empty(),
             "exact lookup should stay disk-backed"
         );
         assert!(loaded.span_matches(
-            (1, 10),
+            (Some(7), 1, 10),
             &attr_filter(&[("project_id", "alpha"), ("skill", "review")])
         ));
         assert!(!loaded.span_matches(
-            (2, 20),
+            (Some(7), 2, 20),
             &attr_filter(&[("project_id", "alpha"), ("skill", "review")])
         ));
 
@@ -963,7 +978,7 @@ mod tests {
         };
         assert_eq!(
             loaded.candidate_span_keys(&time_filtered),
-            HashSet::from([(2, 20)])
+            HashSet::from([(Some(7), 2, 20)])
         );
 
         // compaction 只推进 manifest 时，不应重建整份侧车，但必须原子更新版本头。
@@ -980,7 +995,7 @@ mod tests {
                 ("project_id", "alpha"),
                 ("skill", "review")
             ])),
-            HashSet::from([(1, 10), (4, 40)])
+            HashSet::from([(Some(7), 1, 10), (None, 4, 40)])
         );
         assert!(FilterAttrsIndex::load_cache(&path, 9, 3).is_none());
         let _ = std::fs::remove_dir_all(dir);

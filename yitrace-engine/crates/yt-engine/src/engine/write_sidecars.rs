@@ -49,7 +49,7 @@ impl WriteCoordinator {
 
         {
             let mt = self.memtable.lock().unwrap();
-            for row in mt.read_range(snap.retained_watermark, snap.live_lsn) {
+            for row in mt.read_range(snap.manifest.memtable_watermark, snap.live_lsn) {
                 records.push(WalRecord {
                     trace_id: row.trace_id,
                     span_id: row.span_id,
@@ -66,10 +66,11 @@ impl WriteCoordinator {
     fn collect_segment_rollup_parts(
         &self,
         manifest: &Manifest,
-    ) -> (Vec<WalRecord>, Vec<((u64, u64), SpanFields)>) {
+    ) -> (Vec<WalRecord>, Vec<(ScopedSpanKey, SpanFields)>) {
         let mut records = Vec::new();
         let mut patches = Vec::new();
         for entry in manifest.segments.values() {
+            let record_start = records.len();
             for (row, record) in self
                 .segments
                 .scan_records(entry.segment_id)
@@ -82,11 +83,29 @@ impl WriteCoordinator {
                 records.push(record);
             }
             if let Some(upgrade) = &entry.upgrade_ref {
-                patches.extend(
-                    upgrade.iter().map(|(&(trace_id, span_id), fields)| {
-                        ((trace_id, span_id), fields.clone())
-                    }),
-                );
+                for (&(trace_id, span_id), fields) in upgrade.iter() {
+                    let tenant = if let Some(tenant) = fields.tenant_id {
+                        Some(Some(tenant))
+                    } else {
+                        let tenants = records[record_start..]
+                            .iter()
+                            .filter(|record| {
+                                record.trace_id == trace_id && record.span_id == span_id
+                            })
+                            .map(|record| record.fields.tenant_id)
+                            .collect::<HashSet<_>>();
+                        if tenants.len() == 1 {
+                            tenants.into_iter().next()
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(tenant) = tenant {
+                        let mut fields = fields.clone();
+                        fields.tenant_id = tenant;
+                        patches.push(((tenant, trace_id, span_id), fields));
+                    }
+                }
             }
         }
         (records, patches)
@@ -140,7 +159,7 @@ impl WriteCoordinator {
     }
 
     fn rebuild_trace_rollup_current(&self) {
-        let snap = self.pin_snapshot();
+        let snap = self.current.pin_snapshot();
         self.rebuild_trace_rollup_from_snapshot(&snap);
         self.read_model_load_state.lock().unwrap().rollup_ready = true;
     }
@@ -149,10 +168,14 @@ impl WriteCoordinator {
         if self.read_model_load_state.lock().unwrap().rollup_ready {
             return;
         }
-        let _process = self.acquire_process_lock("write");
-        let _local = self.write_lock.lock().unwrap();
-        self.refresh_from_disk_locked();
-        self.ensure_trace_rollup_current_locked();
+        let result = (|| -> std::io::Result<()> {
+            let _process = self.try_acquire_process_lock("write")?;
+            let _local = self.write_lock.lock().unwrap();
+            self.refresh_from_disk_locked()?;
+            self.ensure_trace_rollup_current_locked();
+            Ok(())
+        })();
+        result.expect("yiTrace derived index refresh failed");
     }
 
     fn ensure_trace_rollup_current_locked(&self) {
@@ -180,7 +203,7 @@ impl WriteCoordinator {
         let (mut records, patches) = self.collect_segment_rollup_parts(&snap.manifest);
         {
             let mt = self.memtable.lock().unwrap();
-            for row in mt.read_range(snap.retained_watermark, snap.live_lsn) {
+            for row in mt.read_range(snap.manifest.memtable_watermark, snap.live_lsn) {
                 records.push(WalRecord {
                     trace_id: row.trace_id,
                     span_id: row.span_id,
@@ -224,10 +247,11 @@ impl WriteCoordinator {
         let Some(path) = &self.bm25_path else {
             return false;
         };
-        if !self
-            .bm25
-            .load_cache(path, manifest.version.get(), manifest.memtable_watermark.get())
-        {
+        if !self.bm25.load_cache(
+            path,
+            manifest.version.get(),
+            manifest.memtable_watermark.get(),
+        ) {
             return false;
         }
         olog::log(
@@ -249,10 +273,11 @@ impl WriteCoordinator {
             return;
         }
         let manifest = self.current.manifest();
-        match self
-            .bm25
-            .save_cache(path, manifest.version.get(), manifest.memtable_watermark.get())
-        {
+        match self.bm25.save_cache(
+            path,
+            manifest.version.get(),
+            manifest.memtable_watermark.get(),
+        ) {
             Ok(true) | Ok(false) => {}
             Err(err) => olog::log(
                 olog::Level::Warn,
@@ -272,17 +297,19 @@ impl WriteCoordinator {
         // 否则一次维护操作后，迟到的 SDK retry 会重新增加词频。
         for entry in snap.manifest.segments.values() {
             for record in self.segments.scan_records(entry.segment_id) {
-                self.bm25.mark_event(record.identity.event_id().0);
+                self.bm25
+                    .mark_event_scoped(record.fields.tenant_id, record.identity.event_id().0);
             }
         }
         let memtable = self.memtable.lock().unwrap();
-        for row in memtable.read_range(snap.retained_watermark, snap.live_lsn) {
-            self.bm25.mark_event(row.identity.event_id().0);
+        for row in memtable.read_range(snap.manifest.memtable_watermark, snap.live_lsn) {
+            self.bm25
+                .mark_event_scoped(row.fields.tenant_id, row.identity.event_id().0);
         }
     }
 
     fn rebuild_bm25_current(&self) {
-        let snap = self.pin_snapshot();
+        let snap = self.current.pin_snapshot();
         self.rebuild_bm25_from_snapshot(&snap);
     }
 
@@ -306,8 +333,12 @@ impl WriteCoordinator {
             parts.push(log);
         }
         if !parts.is_empty() {
-            self.bm25
-                .index_text(span.trace_id, span.span_id, &parts.join(" "));
+            self.bm25.index_text_scoped(
+                span.tenant_id,
+                span.trace_id,
+                span.span_id,
+                &parts.join(" "),
+            );
         }
     }
 
@@ -399,7 +430,7 @@ impl WriteCoordinator {
     }
 
     fn rebuild_filter_attrs_current(&self) {
-        let snap = self.pin_snapshot();
+        let snap = self.current.pin_snapshot();
         self.rebuild_filter_attrs_from_snapshot(&snap);
         self.read_model_load_state
             .lock()
@@ -416,10 +447,14 @@ impl WriteCoordinator {
         {
             return;
         }
-        let _process = self.acquire_process_lock("write");
-        let _local = self.write_lock.lock().unwrap();
-        self.refresh_from_disk_locked();
-        self.ensure_filter_attrs_current_locked();
+        let result = (|| -> std::io::Result<()> {
+            let _process = self.try_acquire_process_lock("write")?;
+            let _local = self.write_lock.lock().unwrap();
+            self.refresh_from_disk_locked()?;
+            self.ensure_filter_attrs_current_locked();
+            Ok(())
+        })();
+        result.expect("yiTrace derived index refresh failed");
     }
 
     fn ensure_filter_attrs_current_locked(&self) {
@@ -458,7 +493,7 @@ impl WriteCoordinator {
         self.persist_seg_key_bloom_segments();
     }
 
-    fn filter_candidate_span_keys(&self, filter: &SearchFilter) -> HashSet<(u64, u64)> {
+    fn filter_candidate_span_keys(&self, filter: &SearchFilter) -> HashSet<ScopedSpanKey> {
         self.ensure_filter_attrs_current();
         let mut index = self.filter_attrs.lock().unwrap();
         index.candidate_span_keys(filter)

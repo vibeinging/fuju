@@ -5,10 +5,12 @@ impl EngineJsonApi {
                 tenant_id: tenant,
                 ..Default::default()
             }),
-            dataset_associations: self.coord.dataset_associations(&crate::DatasetAssociationFilter {
-                tenant_id: tenant,
-                ..Default::default()
-            }),
+            dataset_associations: self.coord.dataset_associations(
+                &crate::DatasetAssociationFilter {
+                    tenant_id: tenant,
+                    ..Default::default()
+                },
+            ),
         }
     }
 
@@ -28,7 +30,16 @@ impl EngineJsonApi {
         };
         let outcome = match self.retention_plan_for_config(body, &config, tenant) {
             Ok(outcome) => outcome,
-            Err(e) => return (400, format!(r#"{{"error":"{}"}}"#, e.replace('"', "'"))),
+            Err(e) => {
+                return (
+                    if e.starts_with("storage failure:") {
+                        500
+                    } else {
+                        400
+                    },
+                    format!(r#"{{"error":"{}"}}"#, e.replace('"', "'")),
+                )
+            }
         };
         (200, json_retention_plan(&config, &outcome))
     }
@@ -46,20 +57,29 @@ impl EngineJsonApi {
             .map(|span| span.trace_id)
             .collect::<std::collections::HashSet<_>>();
         let snap = self.coord.pin_snapshot();
-        let bounds = self.coord.trace_time_bounds(&snap, &all_trace_ids);
+        let bounds = self
+            .coord
+            .trace_time_bounds_for_tenant(&snap, &all_trace_ids, tenant);
         let mut candidate_trace_ids = std::collections::HashSet::new();
         for trace_id in &all_trace_ids {
             let Some((_, max_ts)) = bounds.get(trace_id) else {
                 continue;
             };
-            if config.cutoff.map(|cutoff| *max_ts <= cutoff).unwrap_or(true) {
+            if config
+                .cutoff
+                .map(|cutoff| *max_ts <= cutoff)
+                .unwrap_or(true)
+            {
                 candidate_trace_ids.insert(*trace_id);
             }
         }
 
         let metadata = self.storage_metadata_for_retention(tenant);
         let protected = protected_trace_reasons(&candidate_trace_ids, &metadata, config);
-        let protected_trace_ids = protected.keys().copied().collect::<std::collections::HashSet<_>>();
+        let protected_trace_ids = protected
+            .keys()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
         let deletable_trace_ids = candidate_trace_ids
             .difference(&protected_trace_ids)
             .copied()
@@ -69,18 +89,26 @@ impl EngineJsonApi {
         let protected_stats = storage_bucket_for_trace_ids(&spans, &protected_trace_ids);
         let deletable_stats = storage_bucket_for_trace_ids(&spans, &deletable_trace_ids);
         let applied = if config.apply {
-            Some(self.coord.delete_segment_rows_for_traces(&snap, &deletable_trace_ids))
+            Some(
+                self.coord
+                    .try_delete_segment_rows_for_traces_for_tenant(
+                        &snap,
+                        &deletable_trace_ids,
+                        tenant,
+                    )
+                    .map_err(|e| format!("storage failure: {e}"))?,
+            )
         } else {
             None
         };
         drop(snap);
         let compacted = if config.apply && config.compact_after_apply {
-            Some(self.coord.compact_deleted_segments(
+            Some(self.coord.try_compact_deleted_segments(
                 config.compact_max_segments,
                 config.compact_min_deleted_rows,
                 config.compact_min_deleted_percent,
                 config.reclaim_after_compact,
-            ))
+            ).map_err(|e|format!("storage failure: retention deletion may already have committed; compaction failed: {e}"))?)
         } else {
             None
         };
@@ -104,7 +132,7 @@ impl EngineJsonApi {
                     .as_ref()
                     .map(|result| result.skipped_live_trace_ids.len() > skipped_sample.len())
                     .unwrap_or(false);
-            Some(self.coord.add_retention_audit(
+            Some(self.coord.try_add_retention_audit(
                 crate::NewRetentionAuditRecord {
                     source: config.audit_source.clone(),
                     reason: config.audit_reason.clone(),
@@ -158,7 +186,7 @@ impl EngineJsonApi {
                     trace_id_sample_truncated: sample_truncated,
                 },
                 tenant,
-            ))
+            ).map_err(|e|format!("storage failure: retention deletion may already have committed; audit failed: {e}"))?)
         } else {
             None
         };
@@ -210,18 +238,19 @@ impl EngineJsonApi {
             tenant_id: tenant,
             ..Default::default()
         };
-        filter.audit_id = json_field_alias(f, &["audit_id", "auditId", "id"])
-            .and_then(crate::wire::Json::as_u64);
-        filter.source =
-            json_field_alias(f, &["source", "requestedBy", "requested_by", "actor"])
-                .and_then(crate::wire::Json::as_str)
-                .map(ToString::to_string);
+        filter.audit_id =
+            json_field_alias(f, &["audit_id", "auditId", "id"]).and_then(crate::wire::Json::as_u64);
+        filter.source = json_field_alias(f, &["source", "requestedBy", "requested_by", "actor"])
+            .and_then(crate::wire::Json::as_str)
+            .map(ToString::to_string);
         filter.min_created_at_ns =
             json_field_alias(f, &["created_after_ns", "createdAfterNs", "minCreatedAtNs"])
                 .and_then(crate::wire::Json::as_u64);
-        filter.max_created_at_ns =
-            json_field_alias(f, &["created_before_ns", "createdBeforeNs", "maxCreatedAtNs"])
-                .and_then(crate::wire::Json::as_u64);
+        filter.max_created_at_ns = json_field_alias(
+            f,
+            &["created_before_ns", "createdBeforeNs", "maxCreatedAtNs"],
+        )
+        .and_then(crate::wire::Json::as_u64);
         let cursor = json_field_alias(&v, &["cursor", "offset"])
             .and_then(crate::wire::Json::as_u64)
             .unwrap_or(0) as usize;
@@ -246,10 +275,25 @@ impl EngineJsonApi {
         });
         let total = items.len();
         let end = cursor.saturating_add(limit).min(total);
-        let page = if cursor < total { &items[cursor..end] } else { &[][..] };
-        let body = page.iter().map(json_retention_audit).collect::<Vec<_>>().join(",");
-        let next = if end < total { end.to_string() } else { "null".to_string() };
-        format!(r#"{{"items":[{}],"nextCursor":{},"total":{}}}"#, body, next, total)
+        let page = if cursor < total {
+            &items[cursor..end]
+        } else {
+            &[][..]
+        };
+        let body = page
+            .iter()
+            .map(json_retention_audit)
+            .collect::<Vec<_>>()
+            .join(",");
+        let next = if end < total {
+            end.to_string()
+        } else {
+            "null".to_string()
+        };
+        format!(
+            r#"{{"items":[{}],"nextCursor":{},"total":{}}}"#,
+            body, next, total
+        )
     }
 
     fn create_retention_policy_json(&self, body: &str, tenant: Option<u64>) -> (u16, String) {
@@ -288,7 +332,7 @@ impl EngineJsonApi {
             );
         }
         let now = unix_now_ns_u64_for_http();
-        let policy = self.coord.add_retention_policy(
+        let policy = match self.coord.try_add_retention_policy(
             crate::NewRetentionPolicy {
                 name,
                 enabled: json_bool_alias(&v, &["enabled"]).unwrap_or(true),
@@ -298,7 +342,13 @@ impl EngineJsonApi {
                 interval_ns,
                 source: json_field_alias(
                     &v,
-                    &["source", "requestedBy", "requested_by", "actor", "createdBy"],
+                    &[
+                        "source",
+                        "requestedBy",
+                        "requested_by",
+                        "actor",
+                        "createdBy",
+                    ],
                 )
                 .and_then(crate::wire::Json::as_str)
                 .map(ToString::to_string),
@@ -308,7 +358,15 @@ impl EngineJsonApi {
                 query_json: query.to_compact_json(),
             },
             tenant,
-        );
+        ) {
+            Ok(policy) => policy,
+            Err(e) => {
+                return (
+                    500,
+                    format!(r#"{{"error":"{}"}}"#, e.to_string().replace('"', "'")),
+                )
+            }
+        };
         (200, json_retention_policy(&policy))
     }
 
@@ -329,7 +387,10 @@ impl EngineJsonApi {
                 _ => {}
             }
         }
-        (200, self.retention_policies_page_json(filter, cursor, limit))
+        (
+            200,
+            self.retention_policies_page_json(filter, cursor, limit),
+        )
     }
 
     fn retention_policies_page_json(
@@ -342,17 +403,28 @@ impl EngineJsonApi {
         items.sort_by_key(|p| p.policy_id);
         let total = items.len();
         let end = cursor.saturating_add(limit).min(total);
-        let page = if cursor < total { &items[cursor..end] } else { &[][..] };
-        let body = page.iter().map(json_retention_policy).collect::<Vec<_>>().join(",");
-        let next = if end < total { end.to_string() } else { "null".to_string() };
-        format!(r#"{{"items":[{}],"nextCursor":{},"total":{}}}"#, body, next, total)
+        let page = if cursor < total {
+            &items[cursor..end]
+        } else {
+            &[][..]
+        };
+        let body = page
+            .iter()
+            .map(json_retention_policy)
+            .collect::<Vec<_>>()
+            .join(",");
+        let next = if end < total {
+            end.to_string()
+        } else {
+            "null".to_string()
+        };
+        format!(
+            r#"{{"items":[{}],"nextCursor":{},"total":{}}}"#,
+            body, next, total
+        )
     }
 
-    fn run_due_retention_policies_json(
-        &self,
-        body: &str,
-        tenant: Option<u64>,
-    ) -> (u16, String) {
+    fn run_due_retention_policies_json(&self, body: &str, tenant: Option<u64>) -> (u16, String) {
         let v = match parse_json_body_or_empty(body) {
             Ok(v) => v,
             Err(e) => return (400, format!(r#"{{"error":"{}"}}"#, e.replace('"', "'"))),
@@ -382,7 +454,11 @@ impl EngineJsonApi {
                 skipped += 1;
                 continue;
             }
-            if policy.next_run_at_ns.map(|next| next <= now).unwrap_or(false) {
+            if policy
+                .next_run_at_ns
+                .map(|next| next <= now)
+                .unwrap_or(false)
+            {
                 due.push(policy);
             } else {
                 skipped += 1;
@@ -403,11 +479,19 @@ impl EngineJsonApi {
                 Ok(query) => {
                     let (status, result) = self.retention_plan_json(&query, tenant, true);
                     if status == 200 {
+                        let policy = match self.coord.try_mark_retention_policy_ran(
+                            policy.policy_id,
+                            tenant,
+                            now,
+                        ) {
+                            Ok(updated) => updated.unwrap_or(policy),
+                            Err(error) => {
+                                failed += 1;
+                                items.push(format!(r#"{{"policy":{},"ok":false,"statusCode":500,"error":{{"error":"retention applied; policy update failed: {}"}}}}"#,json_retention_policy(&policy),error.to_string().replace('"',"'")));
+                                continue;
+                            }
+                        };
                         ran += 1;
-                        let policy = self
-                            .coord
-                            .mark_retention_policy_ran(policy.policy_id, tenant, now)
-                            .unwrap_or(policy);
                         items.push(format!(
                             r#"{{"policy":{},"ok":true,"statusCode":{},"result":{}}}"#,
                             json_retention_policy(&policy),

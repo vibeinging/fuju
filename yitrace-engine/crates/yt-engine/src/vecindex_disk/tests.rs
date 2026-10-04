@@ -281,8 +281,9 @@ fn cosine_mode_search_recalls_brute_force() {
     };
     let idx = DiskGraphIndex::open(&dir, dim, cfg).unwrap();
     let mut rng = Lcg(0xC05E);
-    for _ in 0..150u64 {
-        idx.index_embedding(1, 0, rng.vec(dim));
+    // 每点用不同span，不能把同一span的150个历史向量当150条真值。
+    for span_id in 0..150u64 {
+        idx.index_embedding(1, span_id, rng.vec(dim));
     }
     let k = 10;
     let mut hit_sum = 0usize;

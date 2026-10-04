@@ -43,7 +43,9 @@ impl NativeYiTraceDb {
             .map_err(|e| napi_err(format!("create data dir failed: {e}")))?;
         let coord = WriteCoordinator::open_durable(&dir)
             .map_err(|e| napi_err(format!("open yiTrace data dir failed: {e}")))?;
-        coord.recover();
+        coord
+            .try_recover()
+            .map_err(|e| napi_err(format!("recover yiTrace failed: {e}")))?;
         let api = EngineJsonApi::new(Arc::clone(&coord));
         Ok(Self {
             coord,
@@ -73,6 +75,7 @@ impl NativeYiTraceDb {
         trace_id: String,
         span_id: String,
         embedding: Vec<f64>,
+        tenant_id: Option<String>,
     ) -> Result<()> {
         self.ensure_open()?;
         if embedding.is_empty() {
@@ -87,8 +90,9 @@ impl NativeYiTraceDb {
             }
             vector.push(value as f32);
         }
-        self.coord.index_embedding(trace_id, span_id, vector);
-        Ok(())
+        self.coord
+            .index_embedding_for_tenant(parse_tenant_id(tenant_id)?, trace_id, span_id, vector)
+            .map_err(|e| napi_err(e.to_string()))
     }
 
     #[napi(js_name = "traceSearchJson")]
@@ -408,7 +412,9 @@ impl NativeYiTraceDb {
     #[napi]
     pub fn flush(&self) -> Result<()> {
         self.ensure_open()?;
-        self.coord.flush_memtable();
+        self.coord
+            .try_flush_memtable()
+            .map_err(|e| napi_err(format!("flush yiTrace failed: {e}")))?;
         Ok(())
     }
 
@@ -417,7 +423,9 @@ impl NativeYiTraceDb {
         if self.closed {
             return Ok(());
         }
-        self.coord.flush_memtable();
+        self.coord
+            .try_flush_memtable()
+            .map_err(|e| napi_err(format!("flush yiTrace failed: {e}")))?;
         self.closed = true;
         Ok(())
     }
@@ -451,7 +459,9 @@ impl NativeYiTraceDb {
 impl Drop for NativeYiTraceDb {
     fn drop(&mut self) {
         if !self.closed {
-            self.coord.flush_memtable();
+            if let Err(err) = self.coord.try_flush_memtable() {
+                eprintln!("yiTrace close flush failed: {err}");
+            }
             self.closed = true;
         }
     }

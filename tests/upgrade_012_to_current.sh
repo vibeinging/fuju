@@ -163,10 +163,9 @@ assert load("current-custom-trace-before-retry.json") == trace
 assert load("current-custom-search-before-retry.json") == load("current-custom-search-after-retry.json")
 
 expected = {
-    "bm25.dat": 4,
-    "filter_attrs.dat": 3,
-    # v3 仍受当前引擎支持；只读升级不应为了格式升级强制重写整份 rollup。
-    "trace_rollup.dat": 3,
+    "filter_attrs.dat": 4,
+    # 首次相关使用重建租户身份与事件顺序；clean open 本身仍不加载这些索引。
+    "trace_rollup.dat": 6,
     # v1 没有整文件 CRC；当前引擎首次读取会从真实 segment 重建并升级为 v2。
     "segment_bloom.dat": 2,
 }
@@ -174,6 +173,16 @@ for name, version in expected.items():
     raw = (data_dir / name).read_bytes()
     actual = struct.unpack_from("<I", raw, 4)[0]
     assert actual == version, f"{name}: expected v{version}, got v{actual}"
+
+import zlib
+catalog = (data_dir / "bm25.dat").read_bytes()
+assert catalog[:8] == b"YTBMTS02", "missing CRC-protected tenant-scoped BM25 catalog"
+assert zlib.crc32(catalog[:-4]) == struct.unpack_from("<I", catalog, len(catalog) - 4)[0]
+count = struct.unpack_from("<Q", catalog, 24)[0]
+assert len(catalog) == 36 + count * 8
+for tenant in struct.unpack_from(f"<{count}Q", catalog, 32):
+    child = (data_dir / f"bm25.tenant-{tenant}.dat").read_bytes()
+    assert struct.unpack_from("<I", child, 4)[0] == 4, "BM25 tenant postings must remain v4"
 
 segment_dir = data_dir / "segments"
 segment_files = sorted(segment_dir.glob("seg-*.dat"))

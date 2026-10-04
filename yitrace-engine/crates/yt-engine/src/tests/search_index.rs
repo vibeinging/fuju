@@ -149,8 +149,10 @@ fn tenant_filter_isolates_search_across_tenants() {
     let all = vec![a.clone(), b.clone()];
     wc.ingest(all.clone());
     wc.commit_flush(&all, WalLsn::new(2));
-    wc.index_embedding(1, 10, vec![0.0, 0.0]);
-    wc.index_embedding(2, 20, vec![0.01, 0.0]); // 和租户1的几乎重合
+    wc.index_embedding_for_tenant(Some(1), 1, 10, vec![0.0, 0.0])
+        .unwrap();
+    wc.index_embedding_for_tenant(Some(2), 2, 20, vec![0.01, 0.0])
+        .unwrap(); // 和租户1的几乎重合
     let snap = wc.pin_snapshot();
 
     let t1 = SearchFilter {
@@ -195,14 +197,7 @@ fn text_filter_expands_beyond_initial_bm25_window() {
     let wc = WriteCoordinator::new(store);
     let mut rows = Vec::new();
     for trace_id in 1..=120 {
-        let mut row = ev(
-            trace_id,
-            1,
-            1,
-            Some(0),
-            Some(100),
-            &["任务执行 固定文本"],
-        );
+        let mut row = ev(trace_id, 1, 1, Some(0), Some(100), &["任务执行 固定文本"]);
         row.fields.tenant_id = Some(1);
         if trace_id == 120 {
             row.fields
@@ -218,10 +213,9 @@ fn text_filter_expands_beyond_initial_bm25_window() {
         tenant_id: Some(1),
         ..Default::default()
     };
-    filter.attrs.insert(
-        "project_id".to_string(),
-        "\"target-project\"".to_string(),
-    );
+    filter
+        .attrs
+        .insert("project_id".to_string(), "\"target-project\"".to_string());
 
     let hits = wc.search_text_attr(&snap, "任务执行", 1, &filter);
     assert_eq!(hits.len(), 1, "匹配项在初始 Top 50 外也不能漏召回");

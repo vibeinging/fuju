@@ -62,15 +62,19 @@ impl EngineJsonApi {
                 .map(ToString::to_string),
             attrs,
         };
-        let annotation = self.coord.add_annotation(input, tenant);
-        (200, json_annotation(&annotation))
+        match self.coord.try_add_annotation(input, tenant) {
+            Ok(annotation) => (200, json_annotation(&annotation)),
+            Err(err) => internal_error(err),
+        }
     }
 
     /// GET /v1/annotations?traceId=&label=&attrs={}
     fn annotations_json(&self, query: &str, tenant: Option<u64>) -> (u16, String) {
         let (filter, cursor, limit) = annotation_filter_from_query(query, tenant);
-        let items = self.coord.annotations(&filter);
-        annotations_page_json(items, cursor, limit)
+        match self.coord.try_annotations(&filter) {
+            Ok(items) => annotations_page_json(items, cursor, limit),
+            Err(err) => internal_error(err),
+        }
     }
 
     /// PATCH /v1/annotations/:id：更新审核状态、原因、标签或 attrs。
@@ -82,9 +86,13 @@ impl EngineJsonApi {
             Ok(update) => update,
             Err((status, body)) => return (status, body),
         };
-        match self.coord.update_annotation(annotation_id, tenant, update) {
-            Some(annotation) => (200, json_annotation(&annotation)),
-            None => (404, r#"{"error":"annotation not found"}"#.to_string()),
+        match self
+            .coord
+            .try_update_annotation(annotation_id, tenant, update)
+        {
+            Ok(Some(annotation)) => (200, json_annotation(&annotation)),
+            Ok(None) => (404, r#"{"error":"annotation not found"}"#.to_string()),
+            Err(err) => internal_error(err),
         }
     }
 
@@ -99,10 +107,11 @@ impl EngineJsonApi {
         };
         match self
             .coord
-            .delete_annotation(annotation_id, tenant, reviewer, reason)
+            .try_delete_annotation(annotation_id, tenant, reviewer, reason)
         {
-            Some(annotation) => (200, json_annotation(&annotation)),
-            None => (404, r#"{"error":"annotation not found"}"#.to_string()),
+            Ok(Some(annotation)) => (200, json_annotation(&annotation)),
+            Ok(None) => (404, r#"{"error":"annotation not found"}"#.to_string()),
+            Err(err) => internal_error(err),
         }
     }
 
@@ -172,15 +181,19 @@ impl EngineJsonApi {
                 .map(|n| n.min(u32::MAX as u64) as u32),
             attrs,
         };
-        let assoc = self.coord.add_dataset_association(input, tenant);
-        (200, json_dataset_association(&assoc))
+        match self.coord.try_add_dataset_association(input, tenant) {
+            Ok(assoc) => (200, json_dataset_association(&assoc)),
+            Err(err) => internal_error(err),
+        }
     }
 
     /// GET /v1/dataset-associations?datasetId=&itemId=&traceId=
     fn dataset_associations_json(&self, query: &str, tenant: Option<u64>) -> (u16, String) {
         let (filter, cursor, limit) = dataset_filter_from_query(query, tenant);
-        let items = self.coord.dataset_associations(&filter);
-        dataset_associations_page_json(items, cursor, limit)
+        match self.coord.try_dataset_associations(&filter) {
+            Ok(items) => dataset_associations_page_json(items, cursor, limit),
+            Err(err) => internal_error(err),
+        }
     }
 
     // GET /v1/loops：按 loop_id 汇总。

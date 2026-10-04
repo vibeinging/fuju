@@ -191,21 +191,17 @@ impl FileSegmentStore {
         ))
     }
 
-    /// 原子写：写 tmp + fsync + rename。失败静默（与 InMemory 行为对齐；真实实现应上报）。
-    fn write_atomic(&self, seg: SegmentId, bytes: &[u8]) -> bool {
+    /// 原子写：写 tmp + fsync + rename。任何写入或同步失败均返回，调用方不得发布该段。
+    fn write_atomic(&self, seg: SegmentId, bytes: &[u8]) -> std::io::Result<()> {
         let tmp = self.tmp_path(seg);
-        if let Ok(mut f) = OpenOptions::new()
+        let mut f = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(&tmp)
-        {
-            if f.write_all(bytes).is_ok() {
-                let _ = f.sync_all(); // ★ fsync：落盘后才 rename
-                return fs::rename(&tmp, self.seg_path(seg)).is_ok();
-            }
-        }
-        false
+            .open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        fs::rename(&tmp, self.seg_path(seg))
     }
 
     fn write_index_from_segment_bytes(&self, seg: SegmentId, bytes: &[u8]) -> Option<IndexHeader> {
@@ -457,17 +453,22 @@ fn write_index_part(writer: &mut impl Write, crc: &mut Crc32, bytes: &[u8]) -> s
 
 impl SegmentStore for FileSegmentStore {
     fn flush_to_segment(&self, seg: SegmentId, records: &[WalRecord]) {
+        self.try_flush_to_segment(seg, records)
+            .expect("yiTrace segment write failed");
+    }
+
+    fn try_flush_to_segment(&self, seg: SegmentId, records: &[WalRecord]) -> std::io::Result<()> {
         let payload = yt_wal::encode_records(records);
         let mut buf = Vec::with_capacity(payload.len() + 4);
         buf.extend_from_slice(&yt_wal::crc32(&payload).to_le_bytes());
         buf.extend_from_slice(&payload);
-        if self.write_atomic(seg, &buf) {
-            if let Some(header) = self.write_index_from_segment_bytes(seg, &buf) {
-                if let Ok(mut indexes) = self.validated_indexes.lock() {
-                    indexes.insert(seg.get(), header);
-                }
+        self.write_atomic(seg, &buf)?;
+        if let Some(header) = self.write_index_from_segment_bytes(seg, &buf) {
+            if let Ok(mut indexes) = self.validated_indexes.lock() {
+                indexes.insert(seg.get(), header);
             }
         }
+        Ok(())
     }
 
     fn scan_fold_inputs(&self, seg: SegmentId) -> Vec<(u32, FoldInput)> {

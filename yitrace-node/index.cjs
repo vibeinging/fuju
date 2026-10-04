@@ -395,7 +395,7 @@ class YiTraceDB {
     const response = this.#native.ingestJson(JSON.stringify(events), tenantId(options) ?? this.#tenantId);
     const result = parseJson(response);
     if (options.indexEmbeddings === true || (options.indexEmbeddings !== false && this.#autoIndexEmbeddings)) {
-      await this.indexEmbeddings(embeddingDocsFromEvents(events));
+      await this.indexEmbeddings(embeddingDocsFromEvents(events), options);
     }
     return result;
   }
@@ -423,7 +423,7 @@ class YiTraceDB {
     if (traceId === undefined || traceId === null) throw new Error("indexEmbedding requires traceId");
     if (spanId === undefined || spanId === null) throw new Error("indexEmbedding requires spanId");
     const vector = await this.#vectorForEmbeddingInput(item);
-    this.#native.indexEmbedding(String(traceId), String(spanId), vector);
+    this.#native.indexEmbedding(String(traceId), String(spanId), vector, tenantId(options) ?? this.#tenantId);
     return { indexed: 1 };
   }
 
@@ -466,7 +466,7 @@ class YiTraceDB {
       const spanId = list[i].spanId ?? list[i].span_id;
       if (traceId === undefined || traceId === null) throw new Error(`indexEmbeddings[${i}] requires traceId`);
       if (spanId === undefined || spanId === null) throw new Error(`indexEmbeddings[${i}] requires spanId`);
-      this.#native.indexEmbedding(String(traceId), String(spanId), vectors[i]);
+      this.#native.indexEmbedding(String(traceId), String(spanId), vectors[i], tenantId(options) ?? this.#tenantId);
       indexed += 1;
     }
     return { indexed };

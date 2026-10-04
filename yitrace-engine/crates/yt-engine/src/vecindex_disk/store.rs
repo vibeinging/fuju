@@ -3,6 +3,8 @@ pub struct DiskGraphStore {
     dir: PathBuf,
     nodes: File,
     vectors: File,
+    tenants: File,
+    legacy_tenant_slots: Mutex<Option<(u32, u32)>>,
     dim: usize,
     m: usize,
     max_deg: usize,
@@ -25,6 +27,12 @@ impl DiskGraphStore {
         // 元页：有则读回（dim/m/metric 以盘上为准），无则按传入值创建并落盘。
         let (dim, m, metric) = match Meta::load(&meta_path) {
             Some(meta) => (meta.dim, meta.m, meta.metric),
+            None if meta_path.exists() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid vector metadata",
+                ))
+            }
             None => {
                 Meta {
                     dim,
@@ -50,13 +58,36 @@ impl DiskGraphStore {
             .create(true)
             .open(dir.join("vectors"))?;
 
+        let tenants = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(dir.join("tenants"))?;
+
         // 节点数从 nodes 文件长度恢复（撕裂的尾部不足一条则忽略）。
         let count = nodes.metadata()?.len() / node_rec_size as u64;
+        let tenant_slots = tenants.metadata()?.len() / 9;
+        let format_path = dir.join("tenant_format");
+        let modern = format_path.exists();
+        if modern && (std::fs::read(&format_path)? != b"YT-TENANTS-1" || tenant_slots < count) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "missing or invalid modern vector tenant data",
+            ));
+        }
+        // 旧格式没有租户字段。仅记下缺失范围；首次向量操作才扫描节点和真实span解析。
+        let legacy_tenant_slots =
+            (!modern && tenant_slots < count).then_some((tenant_slots as u32, count as u32));
+        if count == 0 && !modern {
+            std::fs::write(&format_path, b"YT-TENANTS-1")?;
+        }
 
         Ok(Self {
             dir,
             nodes,
             vectors,
+            tenants,
+            legacy_tenant_slots: Mutex::new(legacy_tenant_slots),
             dim,
             m,
             max_deg,
@@ -69,6 +100,16 @@ impl DiskGraphStore {
         })
     }
 
+    fn write_tenant(&self, id: u32, tenant_id: Option<u64>) -> std::io::Result<()> {
+        let mut tenant = [0u8; 9];
+        if let Some(value) = tenant_id {
+            tenant[0] = 1;
+            tenant[1..].copy_from_slice(&value.to_le_bytes());
+        }
+        write_all_at(&self.tenants, &tenant, u64::from(id) * 9)?;
+        self.node_cache.lock().unwrap().map.remove(&id);
+        Ok(())
+    }
     pub fn dim(&self) -> usize {
         self.dim
     }
@@ -97,10 +138,27 @@ impl DiskGraphStore {
         vector: &[f32],
         level: u8,
     ) -> std::io::Result<Option<u32>> {
+        self.add_node_scoped(None, trace_id, span_id, vector, level)
+    }
+
+    pub fn add_node_scoped(
+        &self,
+        tenant_id: Option<u64>,
+        trace_id: u64,
+        span_id: u64,
+        vector: &[f32],
+        level: u8,
+    ) -> std::io::Result<Option<u32>> {
         if vector.len() != self.dim {
             return Ok(None);
         }
         let id = self.count.load(Ordering::Acquire);
+        let mut tenant = [0u8; 9];
+        if let Some(value) = tenant_id {
+            tenant[0] = 1;
+            tenant[1..].copy_from_slice(&value.to_le_bytes());
+        }
+        write_all_at(&self.tenants, &tenant, id * 9)?;
         self.write_vector(id, vector)?;
         self.write_node(id, trace_id, span_id, false, level, &[])?;
         // 两个文件都落盘后才提交计数（读者据此判可见）。
@@ -163,9 +221,28 @@ impl DiskGraphStore {
         }
         let mut buf = vec![0u8; self.node_rec_size];
         read_exact_at(&self.nodes, &mut buf, id as u64 * self.node_rec_size as u64)?;
-        let a = Arc::new(decode_node(&buf));
+        let mut decoded = decode_node(&buf);
+        decoded.tenant_id = self.read_tenant(id as u64)?;
+        let a = Arc::new(decoded);
         self.node_cache.lock().unwrap().put(id, a.clone());
         Ok(a)
+    }
+
+    fn read_tenant(&self, id: u64) -> std::io::Result<Option<u64>> {
+        // 旧节点没有该边车；空洞为零，仍表示无租户。新节点先写租户，再提交 nodes 槽。
+        if self.tenants.metadata()?.len() <= id * 9 {
+            return Ok(None);
+        }
+        let mut bytes = [0u8; 9];
+        read_exact_at(&self.tenants, &mut bytes, id * 9)?;
+        match bytes[0] {
+            0 => Ok(None),
+            1 => Ok(Some(u64::from_le_bytes(bytes[1..].try_into().unwrap()))),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid vector tenant identity",
+            )),
+        }
     }
 
     /// 读向量（`Arc<[f32]>`，热路径用，命中只加引用计数、不复制）。
@@ -203,6 +280,7 @@ impl DiskGraphStore {
     /// 刷盘（fsync 向量 + 节点文件）。写操作本身不刷，由调用方在一批写完后 `sync` 一次（批量、快）。
     /// 同进程内重开读页缓存不需要它；它保证的是**崩溃后落盘**。
     pub fn sync(&self) -> std::io::Result<()> {
+        self.tenants.sync_data()?;
         self.vectors.sync_data()?;
         self.nodes.sync_data()
     }
@@ -239,6 +317,7 @@ impl DiskGraphStore {
         self.node_cache.lock().unwrap().put(
             id as u32,
             Arc::new(NodeRec {
+                tenant_id: self.read_tenant(id)?,
                 trace_id,
                 span_id,
                 deleted,
@@ -270,7 +349,10 @@ fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::R
     while !buf.is_empty() {
         let n = file.seek_read(buf, offset)?;
         if n == 0 {
-            return Err(Error::new(ErrorKind::UnexpectedEof, "failed to fill whole buffer"));
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "failed to fill whole buffer",
+            ));
         }
         offset += n as u64;
         let tmp = buf;
@@ -287,7 +369,10 @@ fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> std::io::Result
     while !buf.is_empty() {
         let n = file.seek_write(buf, offset)?;
         if n == 0 {
-            return Err(Error::new(ErrorKind::WriteZero, "failed to write whole buffer"));
+            return Err(Error::new(
+                ErrorKind::WriteZero,
+                "failed to write whole buffer",
+            ));
         }
         offset += n as u64;
         buf = &buf[n..];
@@ -353,6 +438,7 @@ fn decode_node(b: &[u8]) -> NodeRec {
         neighbors.push(u32::from_le_bytes(b[o..o + 4].try_into().unwrap()));
     }
     NodeRec {
+        tenant_id: None,
         trace_id,
         span_id,
         deleted,
